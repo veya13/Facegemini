@@ -45,6 +45,10 @@ AUX_MODEL_URLS = {
         "https://huggingface.co/countfloyd/deepfake/resolve/main/xseg.onnx",
         "https://huggingface.co/facefusion/models-3.0.0/resolve/main/xseg_1.onnx",
     ],
+    "face_parser.onnx": [
+        "https://huggingface.co/facefusion/models-3.0.0/resolve/main/face_parser.onnx",
+        "https://huggingface.co/countfloyd/deepfake/resolve/main/face_parser.onnx",
+    ],
     "restoreformer_plus_plus.onnx": [
         "https://huggingface.co/countfloyd/deepfake/resolve/main/restoreformer_plus_plus.onnx",
     ],
@@ -64,6 +68,7 @@ _CACHE: Dict[str, object] = {
     "enhancer_name": None,
     "enhancer_obj": None,
     "xseg_obj": None,
+    "parser_obj": None,
     "source_key": None,
     "source_face": None,
 }
@@ -109,6 +114,71 @@ def download_from_list(filename: str, urls: List[str], min_bytes: int = 5_000_00
     return None
 
 
+def _rotate_points_back(pts: np.ndarray, angle: int, orig_w: int, orig_h: int) -> np.ndarray:
+    """Mengembalikan koordinat landmark/bbox dari gambar terputar (90/180/270) ke orientasi asli."""
+    if angle == 0:
+        return pts
+    out = pts.copy()
+    if angle == 90:
+        # cv2.ROTATE_90_CLOCKWISE: (x_rot, y_rot) -> (y_rot, orig_h - 1 - x_rot)
+        out[:, 0] = pts[:, 1]
+        out[:, 1] = (orig_h - 1) - pts[:, 0]
+    elif angle == 270:
+        # cv2.ROTATE_90_COUNTERCLOCKWISE: (x_rot, y_rot) -> (orig_w - 1 - y_rot, x_rot)
+        out[:, 0] = (orig_w - 1) - pts[:, 1]
+        out[:, 1] = pts[:, 0]
+    elif angle == 180:
+        out[:, 0] = (orig_w - 1) - pts[:, 0]
+        out[:, 1] = (orig_h - 1) - pts[:, 1]
+    return out
+
+
+def detect_faces_angle_aware(app, frame: np.ndarray, enable_rotation: bool = True):
+    """
+    Deteksi wajah dengan rotasi otomatis (0°, 90°, 270°) agar wajah miring/rebah
+    tetap terdeteksi tegak dan landmark mata/mulut tidak meleset.
+    """
+    faces = app.get(frame)
+    if faces or not enable_rotation:
+        return faces
+
+    h, w = frame.shape[:2]
+    rot_configs = [
+        (90, cv2.ROTATE_90_CLOCKWISE),
+        (270, cv2.ROTATE_90_COUNTERCLOCKWISE),
+    ]
+    for angle, rot_flag in rot_configs:
+        rot_img = cv2.rotate(frame, rot_flag)
+        rot_faces = app.get(rot_img)
+        if rot_faces:
+            restored_faces = []
+            for f in rot_faces:
+                x1, y1, x2, y2 = f.bbox[:4]
+                corners = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+                orig_corners = _rotate_points_back(corners, angle, w, h)
+                new_bbox = np.array(
+                    [
+                        np.min(orig_corners[:, 0]),
+                        np.min(orig_corners[:, 1]),
+                        np.max(orig_corners[:, 0]),
+                        np.max(orig_corners[:, 1]),
+                    ],
+                    dtype=np.float32,
+                )
+                new_kps = _rotate_points_back(np.array(f.kps, dtype=np.float32), angle, w, h)
+                restored_faces.append(
+                    SimpleNamespace(
+                        bbox=new_bbox,
+                        kps=new_kps,
+                        det_score=getattr(f, "det_score", 0.9),
+                        embedding=getattr(f, "embedding", None),
+                        normed_embedding=getattr(f, "normed_embedding", None),
+                    )
+                )
+            return restored_faces
+    return []
+
+
 def align_face_crop(image: np.ndarray, kps: np.ndarray, crop_size: int) -> Tuple[np.ndarray, np.ndarray]:
     scale = crop_size / 112.0
     dst = ARCFACE_DST * scale
@@ -138,18 +208,52 @@ def match_color_lab(source_crop: np.ndarray, target_crop: np.ndarray, mask: np.n
     return cv2.cvtColor(matched, cv2.COLOR_LAB2BGR)
 
 
-def sharpen_eye_region(crop_bgr: np.ndarray, amount: float = 0.35) -> np.ndarray:
-    """Mempertegas detail iris, pupil, dan kelopak mata agar arah tatapan tidak kabur."""
-    h, w = crop_bgr.shape[:2]
-    y1, y2 = int(h * 0.28), int(h * 0.56)
-    x1, x2 = int(w * 0.16), int(w * 0.84)
-    roi = crop_bgr[y1:y2, x1:x2]
-    if roi.size == 0:
-        return crop_bgr
-    blur = cv2.GaussianBlur(roi, (0, 0), 1.2)
-    sharp = cv2.addWeighted(roi, 1.0 + amount, blur, -amount, 0)
-    out = crop_bgr.copy()
-    out[y1:y2, x1:x2] = sharp
+def restore_eye_expression(swapped_crop: np.ndarray, target_crop: np.ndarray, strength: float = 0.35) -> np.ndarray:
+    """
+    Memindahkan dinamika terang-gelap kelopak mata & arah bayangan bola mata dari wajah target
+    ke wajah hasil swap agar tatapan mata lebih hidup dan sinkron dengan ekspresi asli.
+    """
+    if strength <= 0.0:
+        return swapped_crop
+
+    h, w = swapped_crop.shape[:2]
+    out = swapped_crop.copy()
+
+    # ROI kedua mata pada koordinat aligned crop
+    y1, y2 = int(h * 0.32), int(h * 0.54)
+    x1, x2 = int(w * 0.20), int(w * 0.80)
+
+    swap_roi = out[y1:y2, x1:x2]
+    tgt_roi = target_crop[y1:y2, x1:x2]
+    if swap_roi.size == 0:
+        return out
+
+    s_lab = cv2.cvtColor(swap_roi, cv2.COLOR_BGR2LAB).astype(np.float32)
+    t_lab = cv2.cvtColor(tgt_roi, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    # Ekstrak peta bayangan/kelopak mata frekuensi tinggi dari target
+    t_l = t_lab[:, :, 0]
+    t_blur = cv2.GaussianBlur(t_l, (0, 0), 2.5)
+    t_detail = t_l - t_blur
+
+    s_lab[:, :, 0] = np.clip(s_lab[:, :, 0] + t_detail * float(np.clip(strength, 0.0, 0.8)), 0, 255)
+    restored_roi = cv2.cvtColor(s_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+    # Buat gradien halus di pinggir kotak mata
+    mask = np.zeros((y2 - y1, x2 - x1), dtype=np.float32)
+    cv2.ellipse(
+        mask,
+        center=((x2 - x1) // 2, (y2 - y1) // 2),
+        axes=(int((x2 - x1) * 0.45), int((y2 - y1) * 0.42)),
+        angle=0,
+        startAngle=0,
+        endAngle=360,
+        color=1.0,
+        thickness=-1,
+    )
+    mask = cv2.GaussianBlur(mask, (9, 9), 0)[..., None]
+    blended = restored_roi.astype(np.float32) * mask + swap_roi.astype(np.float32) * (1.0 - mask)
+    out[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
     return out
 
 
@@ -232,6 +336,44 @@ class XSegMasker:
         return cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
+class BiSeNetFaceParser:
+    """
+    Face Parser (BiSeNet) untuk memisahkan area wajah (kulit, mata, alis, hidung, bibir)
+    dari rambut/poni sehingga poni yang jatuh di dahi/mata tidak tertimpa.
+    """
+
+    # Kelas CelebAMask-HQ standar: 1=skin, 2=l_brow, 3=r_brow, 4=l_eye, 5=r_eye, 10=nose, 11=mouth, 12=u_lip, 13=l_lip
+    FACE_CLASSES = {1, 2, 3, 4, 5, 10, 11, 12, 13}
+
+    def __init__(self, model_path: Path):
+        import onnxruntime as ort
+
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        self.session = ort.InferenceSession(str(model_path), providers=providers)
+        self.input_name = self.session.get_inputs()[0].name
+        shape = self.session.get_inputs()[0].shape
+        self.size = int(shape[2]) if len(shape) == 4 and isinstance(shape[2], int) else 512
+
+    def predict_face_region_mask(self, crop_bgr: np.ndarray) -> np.ndarray:
+        h, w = crop_bgr.shape[:2]
+        img = cv2.resize(crop_bgr, (self.size, self.size), interpolation=cv2.INTER_LINEAR)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        norm = (img_rgb - mean) / std
+        tensor = np.transpose(norm, (2, 0, 1))[None, ...].astype(np.float32)
+
+        out = self.session.run(None, {self.input_name: tensor})[0][0]
+        if out.ndim == 3:
+            cls_map = np.argmax(out, axis=0)
+        else:
+            cls_map = out.astype(np.int32)
+
+        mask = np.isin(cls_map, list(self.FACE_CLASSES)).astype(np.float32)
+        mask = cv2.GaussianBlur(mask, (7, 7), 0)
+        return cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
 class OnnxFaceEnhancer:
     def __init__(self, model_path: Path, model_type: str):
         import onnxruntime as ort
@@ -306,6 +448,17 @@ def get_xseg() -> Optional[XSegMasker]:
     return obj
 
 
+def get_face_parser() -> Optional[BiSeNetFaceParser]:
+    if _CACHE["parser_obj"] is not None:
+        return _CACHE["parser_obj"]
+    ppath = download_from_list("face_parser.onnx", AUX_MODEL_URLS["face_parser.onnx"], min_bytes=10_000_000)
+    if ppath is None:
+        return None
+    obj = BiSeNetFaceParser(ppath)
+    _CACHE["parser_obj"] = obj
+    return obj
+
+
 def get_enhancer(enhancer_choice: str) -> Optional[OnnxFaceEnhancer]:
     if enhancer_choice == "none":
         return None
@@ -354,7 +507,7 @@ def load_source_face(source_file: str, app):
                 img = cv2.imread(str(fpath))
                 if img is None:
                     continue
-                faces = app.get(img)
+                faces = detect_faces_angle_aware(app, img, enable_rotation=True)
                 if faces:
                     best = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
                     detected_faces.append(best)
@@ -378,7 +531,7 @@ def load_source_face(source_file: str, app):
     src_img = cv2.imread(str(src_path))
     if src_img is None:
         raise FileNotFoundError(f"Gagal membaca file sumber: {src_path}")
-    faces = app.get(src_img)
+    faces = detect_faces_angle_aware(app, src_img, enable_rotation=True)
     if not faces:
         raise RuntimeError("Wajah tidak terdeteksi pada gambar sumber.")
     best_face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
@@ -394,12 +547,14 @@ def process_face_advanced(
     swapper: UniversalOnnxSwapper,
     enhancer_obj: Optional[OnnxFaceEnhancer],
     xseg_obj: Optional[XSegMasker],
+    parser_obj: Optional[BiSeNetFaceParser],
     swap_weight: float = 1.0,
-    enhancer_blend: float = 0.45,
+    enhancer_blend: float = 0.30,
+    eye_expr_strength: float = 0.35,
     use_color_match: bool = True,
     use_xseg: bool = True,
+    use_face_parser: bool = True,
     protect_mouth: bool = True,
-    protect_eyes: bool = True,
     mask_blur: int = 13,
 ) -> np.ndarray:
     h, w = frame.shape[:2]
@@ -408,7 +563,7 @@ def process_face_advanced(
     aligned_tgt, M = align_face_crop(frame, face.kps, crop_size=crop_size)
     swapped_crop = swapper.swap_crop(aligned_tgt, src_face)
 
-    # 1. Buat mask oval wajah
+    # 1. Buat mask oval dasar wajah
     base_mask = np.zeros((crop_size, crop_size), dtype=np.float32)
     cv2.ellipse(
         base_mask,
@@ -425,7 +580,14 @@ def process_face_advanced(
     base_mask[:top_pad, :] = 0.0
     base_mask[crop_size - bot_pad :, :] = 0.0
 
-    # 2. Gabungkan dengan XSeg Occlusion Mask + proteksi zona mata & mulut
+    combined_mask = base_mask.copy()
+
+    # 2. BiSeNet Face Parser: memisahkan wajah dari poni rambut agar poni di dahi/mata tidak tertimpa
+    if use_face_parser and parser_obj is not None:
+        region_mask = parser_obj.predict_face_region_mask(aligned_tgt)
+        combined_mask = combined_mask * region_mask
+
+    # 3. XSeg Occlusion Mask + proteksi khusus zona mulut
     if use_xseg and xseg_obj is not None:
         occ_mask = xseg_obj.predict_mask(aligned_tgt)
         if protect_mouth:
@@ -441,43 +603,17 @@ def process_face_advanced(
                 thickness=-1,
             )
             occ_mask = np.maximum(occ_mask, mouth_zone)
+        combined_mask = combined_mask * occ_mask
 
-        if protect_eyes:
-            eye_zone = np.zeros((crop_size, crop_size), dtype=np.float32)
-            # Mata kiri & mata kanan pada koordinat aligned crop
-            cv2.ellipse(
-                eye_zone,
-                center=(int(crop_size * 0.34), int(crop_size * 0.45)),
-                axes=(int(crop_size * 0.14), int(crop_size * 0.08)),
-                angle=0,
-                startAngle=0,
-                endAngle=360,
-                color=1.0,
-                thickness=-1,
-            )
-            cv2.ellipse(
-                eye_zone,
-                center=(int(crop_size * 0.66), int(crop_size * 0.45)),
-                axes=(int(crop_size * 0.14), int(crop_size * 0.08)),
-                angle=0,
-                startAngle=0,
-                endAngle=360,
-                color=1.0,
-                thickness=-1,
-            )
-            occ_mask = np.maximum(occ_mask, eye_zone)
-
-        combined_mask = base_mask * occ_mask
-    else:
-        combined_mask = base_mask
-
-    # 3. Samakan warna kulit dengan pencahayaan target
+    # 4. Samakan warna kulit dengan pencahayaan target
     if use_color_match:
         swapped_crop = match_color_lab(swapped_crop, aligned_tgt, combined_mask)
 
-    # 4. Pertajam detail mata sebelum & sesudah enhancer agar pupil tidak blur
-    swapped_crop = sharpen_eye_region(swapped_crop, amount=0.35)
+    # 5. Expression Restorer pada mata (mempertahankan arah bayangan & kelopak mata target)
+    if eye_expr_strength > 0.0:
+        swapped_crop = restore_eye_expression(swapped_crop, aligned_tgt, strength=float(eye_expr_strength))
 
+    # 6. Face Enhancer (RestoreFormer++ / GPEN-512)
     if enhancer_obj is not None and enhancer_blend > 0.0:
         enhanced = enhancer_obj.enhance_crop(swapped_crop)
         eb = float(np.clip(enhancer_blend, 0.0, 1.0))
@@ -487,7 +623,6 @@ def process_face_advanced(
             255,
         ).astype(np.uint8)
 
-    # 5. Haluskan tepi luar saja & gunakan INTER_CUBIC saat rotasi balik kepala miring
     k = max(5, int(mask_blur) | 1)
     soft_mask = cv2.GaussianBlur(combined_mask, (k, k), 0) * float(np.clip(swap_weight, 0.0, 1.0))
 
@@ -530,9 +665,11 @@ def preview_single_frame(
     swap_weight: float,
     enhancer: str,
     enhancer_blend: float,
+    eye_expr_strength: float,
+    use_angle_rot: bool,
+    use_face_parser: bool,
     use_xseg: bool,
     protect_mouth: bool,
-    protect_eyes: bool,
     use_color_match: bool,
     face_mode: str,
     det_size: int,
@@ -546,6 +683,7 @@ def preview_single_frame(
         swapper = get_swapper(swapper_model)
         enhancer_obj = get_enhancer(enhancer)
         xseg_obj = get_xseg() if use_xseg else None
+        parser_obj = get_face_parser() if use_face_parser else None
         src_face = load_source_face(source_file, app)
 
         target_path = Path(target_file)
@@ -569,7 +707,10 @@ def preview_single_frame(
             status = f"Preview Gambar | Model: {swapper.model_name}"
 
         out_frame = frame.copy()
-        faces = select_target_faces(app.get(frame), mode=face_mode)
+        raw_faces = detect_faces_angle_aware(app, frame, enable_rotation=bool(use_angle_rot))
+        faces = select_target_faces(raw_faces, mode=face_mode)
+        if not faces:
+            status += " (Wajah tidak terdeteksi pada frame ini)"
         for face in faces:
             out_frame = process_face_advanced(
                 out_frame,
@@ -578,12 +719,14 @@ def preview_single_frame(
                 swapper=swapper,
                 enhancer_obj=enhancer_obj,
                 xseg_obj=xseg_obj,
+                parser_obj=parser_obj,
                 swap_weight=float(swap_weight),
                 enhancer_blend=float(enhancer_blend),
+                eye_expr_strength=float(eye_expr_strength),
                 use_color_match=bool(use_color_match),
                 use_xseg=bool(use_xseg),
+                use_face_parser=bool(use_face_parser),
                 protect_mouth=bool(protect_mouth),
-                protect_eyes=bool(protect_eyes),
                 mask_blur=int(mask_blur),
             )
 
@@ -599,9 +742,11 @@ def run_render_full(
     swap_weight: float,
     enhancer: str,
     enhancer_blend: float,
+    eye_expr_strength: float,
+    use_angle_rot: bool,
+    use_face_parser: bool,
     use_xseg: bool,
     protect_mouth: bool,
-    protect_eyes: bool,
     use_color_match: bool,
     face_mode: str,
     det_size: int,
@@ -615,6 +760,7 @@ def run_render_full(
     swapper = get_swapper(swapper_model)
     enhancer_obj = get_enhancer(enhancer)
     xseg_obj = get_xseg() if use_xseg else None
+    parser_obj = get_face_parser() if use_face_parser else None
     src_face = load_source_face(source_file, app)
 
     target_path = Path(target_file)
@@ -644,7 +790,8 @@ def run_render_full(
                 break
             idx += 1
             out_frame = frame.copy()
-            faces = select_target_faces(app.get(frame), mode=face_mode)
+            raw_faces = detect_faces_angle_aware(app, frame, enable_rotation=bool(use_angle_rot))
+            faces = select_target_faces(raw_faces, mode=face_mode)
             for face in faces:
                 out_frame = process_face_advanced(
                     out_frame,
@@ -653,12 +800,14 @@ def run_render_full(
                     swapper=swapper,
                     enhancer_obj=enhancer_obj,
                     xseg_obj=xseg_obj,
+                    parser_obj=parser_obj,
                     swap_weight=float(swap_weight),
                     enhancer_blend=float(enhancer_blend),
+                    eye_expr_strength=float(eye_expr_strength),
                     use_color_match=bool(use_color_match),
                     use_xseg=bool(use_xseg),
+                    use_face_parser=bool(use_face_parser),
                     protect_mouth=bool(protect_mouth),
-                    protect_eyes=bool(protect_eyes),
                     mask_blur=int(mask_blur),
                 )
             writer.write(out_frame)
@@ -688,7 +837,8 @@ def run_render_full(
     if tgt_img is None:
         raise FileNotFoundError(f"Gagal membaca foto target: {target_path}")
     out = tgt_img.copy()
-    faces = select_target_faces(app.get(tgt_img), mode=face_mode)
+    raw_faces = detect_faces_angle_aware(app, tgt_img, enable_rotation=bool(use_angle_rot))
+    faces = select_target_faces(raw_faces, mode=face_mode)
     for face in faces:
         out = process_face_advanced(
             out,
@@ -697,12 +847,14 @@ def run_render_full(
             swapper=swapper,
             enhancer_obj=enhancer_obj,
             xseg_obj=xseg_obj,
+            parser_obj=parser_obj,
             swap_weight=float(swap_weight),
             enhancer_blend=float(enhancer_blend),
+            eye_expr_strength=float(eye_expr_strength),
             use_color_match=bool(use_color_match),
             use_xseg=bool(use_xseg),
+            use_face_parser=bool(use_face_parser),
             protect_mouth=bool(protect_mouth),
-            protect_eyes=bool(protect_eyes),
             mask_blur=int(mask_blur),
         )
     img_out = out_dir / "hasil_swap.png"
@@ -735,7 +887,7 @@ def launch_fast_ui(share: bool = True) -> None:
                 choices=list(SWAPPER_URLS.keys()),
                 value="inswapper_128_fp16",
                 label="Face Swapper Model",
-                info="inswapper_128_fp16 paling stabil untuk sinkronisasi mata & mulut.",
+                info="inswapper_128_fp16 paling konsisten untuk sudut miring & ekspresi.",
             )
             swap_weight_in = gr.Slider(
                 minimum=0.1,
@@ -743,7 +895,7 @@ def launch_fast_ui(share: bool = True) -> None:
                 step=0.05,
                 value=1.0,
                 label="Face Swapper Weight",
-                info="Setel 1.0 agar bola mata & bibir tidak tembus wajah asli.",
+                info="1.0 penuh agar hasil swap tidak transparan/tercampur.",
             )
 
         with gr.Row():
@@ -751,53 +903,68 @@ def launch_fast_ui(share: bool = True) -> None:
                 choices=["restoreformer++", "gpen-512", "codeformer", "none"],
                 value="restoreformer++",
                 label="Face Enhancer",
-                info="restoreformer++ / gpen-512 mempertajam detail pupil & bulu mata.",
+                info="Mempertajam detail kulit, bibir & mata setelah swap.",
             )
             enhancer_blend_in = gr.Slider(
                 minimum=0.0,
                 maximum=1.0,
                 step=0.05,
-                value=0.45,
+                value=0.30,
                 label="Enhancer Blend",
-                info="0.40–0.55 membantu memperjelas arah bola mata di video redup/miring.",
+                info="0.25–0.35 menjaga wajah & mata tetap natural.",
+            )
+            eye_expr_in = gr.Slider(
+                minimum=0.0,
+                maximum=0.8,
+                step=0.05,
+                value=0.35,
+                label="Eye Expression Restorer",
+                info="Mempertahankan arah bayangan kelopak & tatapan mata asli target.",
             )
 
         with gr.Row():
+            use_angle_rot_in = gr.Checkbox(
+                value=True,
+                label="Auto Rotasi Deteksi (90°/270°)",
+                info="Wajib aktif untuk kepala rebah/miring agar titik mata tidak miss.",
+            )
+            use_parser_in = gr.Checkbox(
+                value=True,
+                label="Face Parser (BiSeNet)",
+                info="Memisahkan poni rambut agar tidak tertimpa kulit wajah.",
+            )
             use_xseg_in = gr.Checkbox(
                 value=True,
                 label="XSeg Occlusion Mask",
-                info="Mencegah poni rambut/tangan/kacamata tertimpa wajah.",
+                info="Menjaga tangan/rambut/kacamata di depan wajah tetap utuh.",
             )
-            protect_eyes_in = gr.Checkbox(
-                value=True,
-                label="Kunci Area Mata (Anti-Kabur)",
-                info="Mencegah XSeg membuat bola mata transparan saat kepala miring/redup.",
-            )
+
+        with gr.Row():
             protect_mouth_in = gr.Checkbox(
                 value=True,
-                label="Kunci Area Mulut (Anti-Hilang)",
-                info="Mencegah XSeg memotong bibir saat mulut terbuka/bicara.",
+                label="Kunci Area Mulut",
+                info="Mencegah bibir terpotong saat mulut terbuka/bicara.",
             )
             use_color_in = gr.Checkbox(
                 value=True,
                 label="Color Match (LAB)",
-                info="Menyamakan tone warna kulit dengan cahaya video.",
+                info="Menyamakan warna kulit dengan pencahayaan video.",
             )
-
-        with gr.Row():
             face_mode_in = gr.Dropdown(
                 choices=["largest", "all"],
                 value="largest",
                 label="Target Wajah",
-                info="largest = wajah utama terbesar; all = semua wajah.",
+                info="largest = wajah utama; all = semua wajah.",
             )
+
+        with gr.Row():
             det_size_in = gr.Slider(
                 minimum=320,
                 maximum=960,
                 step=64,
                 value=640,
                 label="Det Size (Presisi Landmark)",
-                info="640 paling presisi mengunci titik sudut mata & bibir.",
+                info="640 mengunci koordinat sudut mata & bibir dengan presisi.",
             )
             mask_blur_in = gr.Slider(
                 minimum=5,
@@ -805,7 +972,7 @@ def launch_fast_ui(share: bool = True) -> None:
                 step=2,
                 value=13,
                 label="Mask Blur (Kehalusan Tepi)",
-                info="11–15 agar tepi pipi halus tapi mata & mulut tetap tajam.",
+                info="11–15 menghaluskan batas pipi tanpa mengaburkan mata/mulut.",
             )
 
         gr.Markdown("---")
@@ -826,9 +993,11 @@ def launch_fast_ui(share: bool = True) -> None:
             swap_weight_in,
             enhancer_in,
             enhancer_blend_in,
+            eye_expr_in,
+            use_angle_rot_in,
+            use_parser_in,
             use_xseg_in,
             protect_mouth_in,
-            protect_eyes_in,
             use_color_in,
             face_mode_in,
             det_size_in,
@@ -850,9 +1019,11 @@ def launch_fast_ui(share: bool = True) -> None:
             swap_weight_in,
             enhancer_in,
             enhancer_blend_in,
+            eye_expr_in,
+            use_angle_rot_in,
+            use_parser_in,
             use_xseg_in,
             protect_mouth_in,
-            protect_eyes_in,
             use_color_in,
             face_mode_in,
             det_size_in,
