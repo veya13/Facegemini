@@ -1,10 +1,13 @@
 import argparse
+import gc
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -27,13 +30,23 @@ MODEL_URLS = {
     ],
 }
 
+# Cache global agar model tidak dimuat berulang kali dan tidak membebani RAM/VRAM
+_CACHE: Dict[str, object] = {
+    "analyser": None,
+    "det_size": None,
+    "swapper": None,
+    "enhancer_name": None,
+    "enhancer_obj": None,
+    "source_key": None,
+    "source_face": None,
+}
+
 
 def run_cmd(cmd: str) -> int:
     return subprocess.call(cmd, shell=True)
 
 
 def ensure_packages(use_gradio: bool) -> None:
-    # Tanpa basicsr/gfpgan sehingga jauh lebih cepat & anti bentrok di Python 3.13
     pkgs = ["insightface==0.7.3", "onnxruntime-gpu", "opencv-python"]
     if use_gradio:
         pkgs.extend(["gradio==5.13.0", "pydantic==2.10.6"])
@@ -45,7 +58,6 @@ def download_model(filename: str, min_bytes: int = 10_000_000) -> Path:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     dest = MODELS_DIR / filename
     if dest.exists() and dest.stat().st_size >= min_bytes:
-        print(f"[OK] Model siap: {dest} ({dest.stat().st_size:,} bytes)")
         return dest
 
     urls = MODEL_URLS.get(filename, [])
@@ -62,8 +74,6 @@ def download_model(filename: str, min_bytes: int = 10_000_000) -> Path:
 
 
 class OnnxFaceEnhancer:
-    """Menjalankan model ONNX enhancer (RestoreFormer++, GPEN-512, CodeFormer) langsung via CUDA."""
-
     def __init__(self, model_path: Path, model_type: str):
         import onnxruntime as ort
 
@@ -71,7 +81,7 @@ class OnnxFaceEnhancer:
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self.session = ort.InferenceSession(str(model_path), providers=providers)
         self.input_name = self.session.get_inputs()[0].name
-        self.input_shape = self.session.get_inputs()[0].shape  # [1, 3, H, W]
+        self.input_shape = self.session.get_inputs()[0].shape
         self.size = int(self.input_shape[2]) if isinstance(self.input_shape[2], int) else 512
         self.input_names = [inp.name for inp in self.session.get_inputs()]
 
@@ -84,7 +94,6 @@ class OnnxFaceEnhancer:
 
         feed = {self.input_name: tensor}
         if len(self.input_names) > 1:
-            # Untuk CodeFormerv0.1.onnx yang membutuhkan input weight (w)
             feed[self.input_names[1]] = np.array([0.5], dtype=np.float64)
 
         out = self.session.run(None, feed)[0][0]
@@ -94,25 +103,39 @@ class OnnxFaceEnhancer:
         return cv2.resize(out_bgr, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
-def build_face_analyser(det_size: int = 640):
+def get_face_analyser(det_size: int = 640):
+    if _CACHE["analyser"] is not None and _CACHE["det_size"] == det_size:
+        return _CACHE["analyser"]
+
     from insightface.app import FaceAnalysis
 
     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
     app = FaceAnalysis(name="buffalo_l", providers=providers)
     app.prepare(ctx_id=0, det_size=(det_size, det_size))
+    _CACHE["analyser"] = app
+    _CACHE["det_size"] = det_size
     return app
 
 
-def build_swapper(swapper_path: Path):
+def get_swapper():
+    if _CACHE["swapper"] is not None:
+        return _CACHE["swapper"]
+
     import insightface
 
+    swapper_path = download_model("inswapper_128.onnx", min_bytes=50_000_000)
     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    return insightface.model_zoo.get_model(str(swapper_path), providers=providers)
+    swapper = insightface.model_zoo.get_model(str(swapper_path), providers=providers)
+    _CACHE["swapper"] = swapper
+    return swapper
 
 
-def build_enhancer(enhancer_choice: str) -> Optional[OnnxFaceEnhancer]:
+def get_enhancer(enhancer_choice: str) -> Optional[OnnxFaceEnhancer]:
     if enhancer_choice == "none":
         return None
+    if _CACHE["enhancer_name"] == enhancer_choice and _CACHE["enhancer_obj"] is not None:
+        return _CACHE["enhancer_obj"]
+
     mapping = {
         "restoreformer++": ("restoreformer_plus_plus.onnx", 100_000_000),
         "gpen-512": ("GPEN-BFR-512.onnx", 100_000_000),
@@ -120,7 +143,67 @@ def build_enhancer(enhancer_choice: str) -> Optional[OnnxFaceEnhancer]:
     }
     fname, min_b = mapping[enhancer_choice]
     mpath = download_model(fname, min_bytes=min_b)
-    return OnnxFaceEnhancer(mpath, enhancer_choice)
+    obj = OnnxFaceEnhancer(mpath, enhancer_choice)
+    _CACHE["enhancer_name"] = enhancer_choice
+    _CACHE["enhancer_obj"] = obj
+    return obj
+
+
+def load_source_face(source_file: str, app):
+    """Mendukung satu foto (.jpg/.png) maupun arsip faceset (.fsz / .zip) dengan rata-rata embedding multi-sudut."""
+    src_path = Path(source_file)
+    cache_key = f"{src_path.resolve()}_{src_path.stat().st_mtime}"
+    if _CACHE["source_key"] == cache_key and _CACHE["source_face"] is not None:
+        return _CACHE["source_face"]
+
+    img_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+    detected_faces = []
+
+    if src_path.suffix.lower() in {".fsz", ".zip"}:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with zipfile.ZipFile(src_path, "r") as zf:
+                zf.extractall(tmpdir)
+            for root, _, files in os.walk(tmpdir):
+                for fname in sorted(files):
+                    fpath = Path(root) / fname
+                    if fpath.suffix.lower() not in img_exts:
+                        continue
+                    img = cv2.imread(str(fpath))
+                    if img is None:
+                        continue
+                    faces = app.get(img)
+                    if faces:
+                        best = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+                        detected_faces.append(best)
+
+        if not detected_faces:
+            raise RuntimeError("Tidak ada wajah yang terdeteksi di dalam file faceset (.fsz).")
+
+        # Gunakan wajah pertama sebagai kerangka objek, lalu gabungkan rata-rata embedding seluruh sudut
+        base_face = detected_faces[0]
+        embeddings = [f.normed_embedding for f in detected_faces if hasattr(f, "normed_embedding") and f.normed_embedding is not None]
+        if embeddings:
+            mean_emb = np.mean(np.stack(embeddings, axis=0), axis=0)
+            norm = np.linalg.norm(mean_emb)
+            if norm > 0:
+                mean_emb = mean_emb / norm
+            base_face.embedding = mean_emb
+            base_face.normed_embedding = mean_emb
+        print(f"[FACESET] Berhasil memuat {len(detected_faces)} sudut wajah dari {src_path.name}")
+        _CACHE["source_key"] = cache_key
+        _CACHE["source_face"] = base_face
+        return base_face
+
+    src_img = cv2.imread(str(src_path))
+    if src_img is None:
+        raise FileNotFoundError(f"Gagal membaca file sumber: {src_path}")
+    faces = app.get(src_img)
+    if not faces:
+        raise RuntimeError("Wajah tidak terdeteksi pada gambar sumber.")
+    best_face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+    _CACHE["source_key"] = cache_key
+    _CACHE["source_face"] = best_face
+    return best_face
 
 
 def build_landmark_mask(frame_shape, face, feather_blur: int = 21) -> np.ndarray:
@@ -160,7 +243,6 @@ def process_face_on_frame(
 ) -> np.ndarray:
     swapped_full = swapper.get(frame.copy(), face, src_face, paste_back=True)
 
-    # Terapkan enhancer hanya pada area crop wajah (jauh lebih cepat & mata lebih akurat)
     if enhancer_obj is not None and enhancer_blend > 0.0:
         h, w = frame.shape[:2]
         x1, y1, x2, y2 = [int(v) for v in face.bbox[:4]]
@@ -197,6 +279,77 @@ def select_target_faces(faces, mode: str = "largest"):
     return [largest]
 
 
+def get_video_frame_count(target_file: Optional[str]) -> int:
+    if not target_file:
+        return 1
+    p = Path(target_file)
+    if p.suffix.lower() not in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
+        return 1
+    cap = cv2.VideoCapture(str(p))
+    if not cap.isOpened():
+        return 1
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    return max(1, total)
+
+
+def preview_single_frame(
+    source_file: Optional[str],
+    target_file: Optional[str],
+    frame_index: int,
+    enhancer: str,
+    enhancer_blend: float,
+    face_mode: str,
+    det_size: int,
+    mask_blur: int,
+    blend_alpha: float,
+) -> Tuple[Optional[np.ndarray], str]:
+    if not source_file or not target_file:
+        return None, "Unggah Sumber Wajah (.jpg/.png/.fsz) dan Target terlebih dahulu untuk melihat Live Preview."
+
+    app = get_face_analyser(det_size=int(det_size))
+    swapper = get_swapper()
+    enhancer_obj = get_enhancer(enhancer)
+    src_face = load_source_face(source_file, app)
+
+    target_path = Path(target_file)
+    video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+    if target_path.suffix.lower() in video_exts:
+        cap = cv2.VideoCapture(str(target_path))
+        if not cap.isOpened():
+            return None, "Gagal membuka file video target."
+        total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+        safe_idx = max(0, min(total - 1, int(frame_index)))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, safe_idx)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret or frame is None:
+            return None, f"Gagal membaca frame ke-{safe_idx}."
+        status = f"Live Preview Frame {safe_idx + 1} / {total}"
+    else:
+        frame = cv2.imread(str(target_path))
+        if frame is None:
+            return None, "Gagal membaca gambar target."
+        status = "Live Preview Gambar Target"
+
+    out_frame = frame.copy()
+    faces = select_target_faces(app.get(frame), mode=face_mode)
+    for face in faces:
+        out_frame = process_face_on_frame(
+            out_frame,
+            face,
+            src_face,
+            swapper,
+            enhancer_obj,
+            enhancer_blend=float(enhancer_blend),
+            mask_blur=int(mask_blur),
+            blend_alpha=float(blend_alpha),
+        )
+
+    rgb_preview = cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB)
+    return rgb_preview, status
+
+
 def run_swap_task(
     source_file: str,
     target_file: str,
@@ -207,23 +360,15 @@ def run_swap_task(
     mask_blur: int = 21,
     blend_alpha: float = 1.0,
     output_file: str = "output/gradio_result.mp4",
+    progress=None,
 ) -> str:
     if not source_file or not target_file:
-        raise ValueError("Foto sumber dan file target wajib diisi.")
+        raise ValueError("Sumber wajah dan file target wajib diisi.")
 
-    swapper_path = download_model("inswapper_128.onnx", min_bytes=50_000_000)
-    app = build_face_analyser(det_size=int(det_size))
-    swapper = build_swapper(swapper_path)
-    enhancer_obj = build_enhancer(enhancer)
-
-    src_img = cv2.imread(source_file)
-    if src_img is None:
-        raise FileNotFoundError(f"Gagal membaca foto sumber: {source_file}")
-
-    src_faces = app.get(src_img)
-    if not src_faces:
-        raise RuntimeError("Wajah tidak terdeteksi pada foto sumber.")
-    src_face = max(src_faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+    app = get_face_analyser(det_size=int(det_size))
+    swapper = get_swapper()
+    enhancer_obj = get_enhancer(enhancer)
+    src_face = load_source_face(source_file, app)
 
     target_path = Path(target_file)
     out_path = Path(output_file)
@@ -238,7 +383,7 @@ def run_swap_task(
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
 
         temp_video = out_path.with_suffix(".raw.mp4")
         writer = cv2.VideoWriter(str(temp_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
@@ -263,11 +408,17 @@ def run_swap_task(
                     blend_alpha=float(blend_alpha),
                 )
             writer.write(out_frame)
-            if idx % 30 == 0 or idx == total:
-                print(f"[CUDA PROSES] Frame {idx}/{total}")
+
+            # Update progress & bersihkan memori secara berkala agar Colab tidak disconnect
+            if idx % 25 == 0 or idx == total:
+                gc.collect()
+                if progress is not None:
+                    progress((idx, total), desc=f"Merender frame {idx}/{total}")
+                print(f"[CUDA PROSES] Frame {idx}/{total}", flush=True)
 
         cap.release()
         writer.release()
+        gc.collect()
 
         mux_cmd = (
             f'ffmpeg -y -i "{temp_video}" -i "{target_path}" '
@@ -309,41 +460,106 @@ def launch_gradio_ui(share: bool = True) -> None:
     providers = ort.get_available_providers()
     gpu_status = "CUDA GPU AKTIF" if "CUDAExecutionProvider" in providers else "CPU MODE (Aktifkan GPU T4 di Colab!)"
 
-    with gr.Blocks(title="FaceSwap ONNX CUDA UI") as demo:
-        gr.Markdown(f"## FaceSwap ONNX CUDA UI — Status: **{gpu_status}**")
-        with gr.Row():
-            source_in = gr.File(label="Foto Wajah Sumber (.png/.jpg)", type="filepath")
-            target_in = gr.File(label="Video atau Foto Target", type="filepath")
+    with gr.Blocks(title="FaceSwap ONNX CUDA Live Preview") as demo:
+        gr.Markdown(f"## FaceSwap ONNX CUDA UI (Live Preview & .FSZ) — **{gpu_status}**")
 
         with gr.Row():
-            enhancer_in = gr.Dropdown(
-                choices=["restoreformer++", "gpen-512", "codeformer", "none"],
-                value="restoreformer++",
-                label="Enhancer ONNX (countfloyd)",
-            )
-            enhancer_blend_in = gr.Slider(
-                minimum=0.0,
-                maximum=1.0,
-                step=0.05,
-                value=0.15,
-                label="Enhancer Blend (Mentok Kiri = Paling Natural)",
-            )
-            face_mode_in = gr.Dropdown(
-                choices=["largest", "all"],
-                value="largest",
-                label="Target Wajah",
+            with gr.Column(scale=1):
+                source_in = gr.File(
+                    label="Sumber Wajah (.jpg / .png / faceset .fsz)",
+                    type="filepath",
+                )
+                target_in = gr.File(
+                    label="Video atau Foto Target",
+                    type="filepath",
+                )
+                enhancer_in = gr.Dropdown(
+                    choices=["restoreformer++", "gpen-512", "codeformer", "none"],
+                    value="restoreformer++",
+                    label="Enhancer ONNX",
+                )
+                enhancer_blend_in = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.05,
+                    value=0.15,
+                    label="Enhancer Blend (Mentok Kiri = Natural)",
+                )
+                face_mode_in = gr.Dropdown(
+                    choices=["largest", "all"],
+                    value="largest",
+                    label="Target Wajah",
+                )
+                det_size_in = gr.Slider(minimum=320, maximum=1024, step=64, value=640, label="Det Size")
+                mask_blur_in = gr.Slider(minimum=11, maximum=51, step=2, value=21, label="Mask Blur")
+                blend_alpha_in = gr.Slider(minimum=0.1, maximum=1.0, step=0.05, value=1.0, label="Face Blend Alpha")
+
+            with gr.Column(scale=1):
+                preview_img = gr.Image(label="Live Preview Hasil Per Frame", interactive=False)
+                frame_slider = gr.Slider(
+                    minimum=0,
+                    maximum=100,
+                    step=1,
+                    value=0,
+                    label="Geser Frame untuk Cek Hasil (Live Preview)",
+                )
+                preview_status = gr.Textbox(label="Info Preview", interactive=False)
+                run_btn = gr.Button("Render Video Lengkap", variant="primary")
+                output_file_box = gr.File(label="Hasil Video/Foto Lengkap")
+                status_box = gr.Textbox(label="Status Render", interactive=False)
+
+        preview_inputs = [
+            source_in,
+            target_in,
+            frame_slider,
+            enhancer_in,
+            enhancer_blend_in,
+            face_mode_in,
+            det_size_in,
+            mask_blur_in,
+            blend_alpha_in,
+        ]
+
+        # Update batas slider saat video target diunggah, lalu render frame awal
+        def on_target_change(src, tgt, enh, eblend, fmode, dsz, mblur, balpha):
+            total = get_video_frame_count(tgt)
+            max_idx = max(0, total - 1)
+            img, msg = preview_single_frame(src, tgt, 0, enh, eblend, fmode, dsz, mblur, balpha)
+            return gr.update(minimum=0, maximum=max_idx, value=0), img, msg
+
+        target_in.change(
+            fn=on_target_change,
+            inputs=[
+                source_in,
+                target_in,
+                enhancer_in,
+                enhancer_blend_in,
+                face_mode_in,
+                det_size_in,
+                mask_blur_in,
+                blend_alpha_in,
+            ],
+            outputs=[frame_slider, preview_img, preview_status],
+        )
+
+        # Otomatis perbarui Live Preview saat slider frame atau setelan digeser
+        for trigger in (
+            source_in.change,
+            frame_slider.release,
+            enhancer_in.change,
+            enhancer_blend_in.release,
+            face_mode_in.change,
+            det_size_in.release,
+            mask_blur_in.release,
+            blend_alpha_in.release,
+        ):
+            trigger(
+                fn=preview_single_frame,
+                inputs=preview_inputs,
+                outputs=[preview_img, preview_status],
             )
 
-        with gr.Row():
-            det_size_in = gr.Slider(minimum=320, maximum=1024, step=64, value=640, label="Det Size")
-            mask_blur_in = gr.Slider(minimum=11, maximum=51, step=2, value=21, label="Mask Blur")
-            blend_alpha_in = gr.Slider(minimum=0.1, maximum=1.0, step=0.05, value=1.0, label="Face Blend Alpha")
-
-        run_btn = gr.Button("Jalankan Proses", variant="primary")
-        output_file_box = gr.File(label="Hasil Keluaran")
-        status_box = gr.Textbox(label="Status / Path File", interactive=False)
-
-        def on_click(src, tgt, enh, eblend, fmode, dsz, mblur, balpha):
+        def on_render_full(src, tgt, enh, eblend, fmode, dsz, mblur, balpha, progress=gr.Progress()):
             res_path = run_swap_task(
                 source_file=src,
                 target_file=tgt,
@@ -353,11 +569,12 @@ def launch_gradio_ui(share: bool = True) -> None:
                 det_size=int(dsz),
                 mask_blur=int(mblur),
                 blend_alpha=float(balpha),
+                progress=progress,
             )
             return res_path, f"Selesai: {res_path}"
 
         run_btn.click(
-            fn=on_click,
+            fn=on_render_full,
             inputs=[
                 source_in,
                 target_in,
@@ -371,17 +588,17 @@ def launch_gradio_ui(share: bool = True) -> None:
             outputs=[output_file_box, status_box],
         )
 
-    demo.launch(share=share, debug=False)
+    demo.queue().launch(share=share, debug=False)
 
 
 def parse_args(argv: Optional[List[str]] = None):
-    parser = argparse.ArgumentParser(description="FaceSwap ONNX CUDA Gradio Runner")
+    parser = argparse.ArgumentParser(description="FaceSwap ONNX CUDA Live Preview Runner")
     parser.add_argument("--no-gradio", action="store_true")
     parser.add_argument("--no-share", action="store_true")
     parser.add_argument("--source", default="")
     parser.add_argument("--target", default="")
     parser.add_argument("--output", default="output/result.mp4")
-    parser.add_argument("--enhancer", choices=["restoreformer++", "gfpgan", "gpen-512", "codeformer", "none"], default="restoreformer++")
+    parser.add_argument("--enhancer", choices=["restoreformer++", "gpen-512", "codeformer", "none"], default="restoreformer++")
     parser.add_argument("--enhancer-blend", type=float, default=0.15)
     parser.add_argument("--face-mode", choices=["largest", "all"], default="largest")
     parser.add_argument("--det-size", type=int, default=640)
