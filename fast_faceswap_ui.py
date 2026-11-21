@@ -135,11 +135,12 @@ def download_from_list(filename: str, urls: List[str], min_bytes: int = 5_000_00
 
 
 def compute_job_id(source_file: str, target_file: str) -> str:
+    """Menghitung job_id stabil berdasarkan ukuran file (bukan nama sementara Gradio) agar selalu konsisten setelah reconnect."""
     sp = Path(source_file) if source_file else None
     tp = Path(target_file) if target_file else None
     s_size = sp.stat().st_size if (sp and sp.exists()) else 0
     t_size = tp.stat().st_size if (tp and tp.exists()) else 0
-    raw = f"{sp.name if sp else ''}|{s_size}|{tp.name if tp else ''}|{t_size}"
+    raw = f"src_size={s_size}|tgt_size={t_size}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
 
 
@@ -179,9 +180,9 @@ class DriveSegmentCheckpoint:
             if src.resolve().parent == self.inputs_dir.resolve():
                 return str(src.resolve())
             stat = src.stat()
-            sig = hashlib.md5(f"{src.name}|{stat.st_size}|{stat.st_mtime}".encode("utf-8")).hexdigest()[:8]
-            safe_name = "".join(c if c.isalnum() or c in (".", "_", "-") else "_" for c in src.name)
-            dst = self.inputs_dir / f"{prefix}_{sig}_{safe_name}"
+            ext = src.suffix.lower()
+            sig = hashlib.md5(f"{prefix}|{stat.st_size}".encode("utf-8")).hexdigest()[:10]
+            dst = self.inputs_dir / f"{prefix}_{sig}{ext}"
             if not dst.exists() or dst.stat().st_size != stat.st_size:
                 shutil.copy2(str(src), str(dst))
             return str(dst.resolve())
@@ -240,6 +241,14 @@ class DriveSegmentCheckpoint:
         d = self.temp_root / job_id
         if d.exists():
             shutil.rmtree(d, ignore_errors=True)
+        release_mem(clean_cuda=True)
+
+    def clear_all_workspace_files(self) -> None:
+        """Menghapus semua segmen sementara, file hasil render di output, dan salinan input persisten."""
+        for folder in (self.temp_root, self.output_dir, self.inputs_dir):
+            if folder.exists():
+                shutil.rmtree(folder, ignore_errors=True)
+            folder.mkdir(parents=True, exist_ok=True)
         release_mem(clean_cuda=True)
 
     def finalize_video(self, job_id: str, target_path: Path, out_name: str = "hasil_swap.mp4") -> Tuple[bool, str]:
@@ -724,7 +733,7 @@ def inspect_source_gallery(source_file: Optional[str]) -> Tuple[List[str], str]:
 
 def load_source_face(source_file: str, app, top_sharp_only: bool = False):
     src_path = Path(source_file)
-    cache_key = f"{src_path.resolve()}_{src_path.stat().st_mtime}_{top_sharp_only}"
+    cache_key = f"{src_path.resolve()}_{src_path.stat().st_size}_{top_sharp_only}"
     if _CACHE["source_key"] == cache_key and _CACHE["source_face"] is not None:
         return _CACHE["source_face"]
 
@@ -1186,10 +1195,17 @@ def run_render_full(
     fresh_start: bool = False,
     progress=None,
 ):
+    ckpt_mgr = get_checkpoint_mgr()
+    latest_unfinished = ckpt_mgr.find_latest_unfinished() if not fresh_start else None
+
+    if not source_file and latest_unfinished:
+        source_file = latest_unfinished.get("settings", {}).get("source_file", "")
+    if not target_file and latest_unfinished:
+        target_file = latest_unfinished.get("settings", {}).get("target_file", "")
+
     if not source_file or not target_file:
         raise ValueError("Sumber wajah dan target wajib diisi.")
 
-    ckpt_mgr = get_checkpoint_mgr()
     persisted_src = ckpt_mgr.persist_input_file(source_file, prefix="src") or source_file
     persisted_tgt = ckpt_mgr.persist_input_file(target_file, prefix="tgt") or target_file
 
@@ -1208,6 +1224,22 @@ def run_render_full(
     video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
     if target_path.suffix.lower() in video_exts:
         job_id = compute_job_id(persisted_src, persisted_tgt)
+
+        if fresh_start:
+            ckpt_mgr.clear_job(job_id)
+            prev_state = None
+        else:
+            prev_state = ckpt_mgr.load_job_state(job_id)
+            if prev_state is None and latest_unfinished is not None:
+                cand_id = latest_unfinished.get("job_id")
+                cand_tot = int(latest_unfinished.get("total_frames", 0))
+                cap_chk = cv2.VideoCapture(str(target_path))
+                cur_tot = int(cap_chk.get(cv2.CAP_PROP_FRAME_COUNT)) if cap_chk.isOpened() else 0
+                cap_chk.release()
+                if cand_id and cand_tot > 0 and cand_tot == cur_tot:
+                    job_id = cand_id
+                    prev_state = latest_unfinished
+
         job_dir = ckpt_mgr.job_dir(job_id)
 
         cap = cv2.VideoCapture(str(target_path))
@@ -1241,17 +1273,22 @@ def run_render_full(
             "segment_frames": int(segment_frames),
         }
 
-        if fresh_start:
-            ckpt_mgr.clear_job(job_id)
-            job_dir = ckpt_mgr.job_dir(job_id)
-            prev_state = None
-        else:
-            prev_state = ckpt_mgr.load_job_state(job_id)
-
         if prev_state and not prev_state.get("completed", False):
-            start_idx = int(prev_state.get("last_completed_idx", 0))
-            seg_num = int(prev_state.get("next_seg_num", 0))
-            print(f"[AUTO-RESUME] Melanjutkan otomatis dari frame {start_idx + 1}/{total} (segmen #{seg_num + 1})...", flush=True)
+            valid_segs = sorted([p for p in job_dir.glob("part_*.mp4") if p.exists() and p.stat().st_size > 0])
+            counted_frames = 0
+            for s_path in valid_segs:
+                c_s = cv2.VideoCapture(str(s_path))
+                if c_s.isOpened():
+                    counted_frames += max(0, int(c_s.get(cv2.CAP_PROP_FRAME_COUNT)))
+                c_s.release()
+
+            state_idx = int(prev_state.get("last_completed_idx", 0))
+            start_idx = counted_frames if counted_frames > 0 else state_idx
+            seg_num = len(valid_segs)
+            print(
+                f"[AUTO-RESUME] Melanjutkan otomatis dari frame {start_idx + 1}/{total} ({seg_num} segmen tersimpan di Drive)...",
+                flush=True,
+            )
         else:
             start_idx = 0
             seg_num = 0
@@ -1319,19 +1356,8 @@ def run_render_full(
                 processed_this_seg += 1
                 last_done_idx = idx + 1
 
-                if processed_this_seg % 20 == 0 or last_done_idx == curr_end:
-                    ckpt_mgr.save_job_state(
-                        job_id,
-                        {
-                            "job_id": job_id,
-                            "last_completed_idx": last_done_idx,
-                            "total_frames": total,
-                            "next_seg_num": seg_num + (1 if last_done_idx == curr_end else 0),
-                            "completed": False,
-                            "settings": settings_snapshot,
-                        },
-                    )
-                    release_mem(clean_cuda=(processed_this_seg % 60 == 0))
+                if processed_this_seg % 10 == 0 or last_done_idx == curr_end:
+                    release_mem(clean_cuda=(processed_this_seg % 50 == 0))
                     if progress is not None:
                         progress((last_done_idx, total), desc=f"Merender frame {last_done_idx}/{total}")
                     print(
@@ -1341,6 +1367,21 @@ def run_render_full(
 
             cap.release()
             writer.release()
+
+            # Simpan state hanya setelah segmen video tertutup sempurna (writer.release) agar tidak korup saat disconnect
+            if processed_this_seg > 0 and seg_file.exists() and seg_file.stat().st_size > 0:
+                ckpt_mgr.save_job_state(
+                    job_id,
+                    {
+                        "job_id": job_id,
+                        "last_completed_idx": last_done_idx,
+                        "total_frames": total,
+                        "next_seg_num": seg_num + 1,
+                        "completed": False,
+                        "settings": settings_snapshot,
+                    },
+                )
+
             release_mem(clean_cuda=True)
 
             curr_start = last_done_idx
@@ -1415,16 +1456,23 @@ def launch_fast_ui(share: bool = True) -> None:
             tot_f = int(latest.get("total_frames", 0))
             return (
                 f"Auto-Resume aktif: progres sampai frame {done_f}/{tot_f} tersimpan di Google Drive. "
-                f"Klik 'Render Video Lengkap' untuk menyambung, atau klik 'Hapus History Progres' untuk mulai baru."
+                f"Klik 'Render Video Lengkap' untuk menyambung, atau klik 'Hapus History & File Hasil' untuk bersihkan semua."
             )
         return "Siap. File input, segmen sementara & hasil akhir disimpan ke Drive; segmen terhapus otomatis saat selesai."
 
-    def reset_all_history():
-        if ckpt_mgr.temp_root.exists():
-            shutil.rmtree(ckpt_mgr.temp_root, ignore_errors=True)
-            ckpt_mgr.temp_root.mkdir(parents=True, exist_ok=True)
-        release_mem(clean_cuda=True)
-        return None, None, [], "History progres lama di Google Drive telah dihapus. Silakan unggah file baru."
+    def reset_all_history_and_outputs():
+        ckpt_mgr.clear_all_workspace_files()
+        _CACHE["source_key"] = None
+        _CACHE["source_face"] = None
+        _CACHE["source_count"] = 0
+        return (
+            None,
+            None,
+            [],
+            None,
+            "Semua history progres, segmen temp & file hasil di Google Drive telah dihapus.",
+            "Siap untuk unggah file baru.",
+        )
 
     with gr.Blocks(title="Fast FaceSwap CUDA UI + Faceset Studio") as demo:
         gr.Markdown(f"### Fast FaceSwap Pro UI & Faceset Studio — **{gpu_status}**")
@@ -1435,7 +1483,7 @@ def launch_fast_ui(share: bool = True) -> None:
                 interactive=False,
                 scale=4,
             )
-            clear_history_btn = gr.Button("Hapus History Progres", variant="stop", scale=1)
+            clear_history_btn = gr.Button("Hapus History & File Hasil", variant="stop", scale=1)
 
         with gr.Row():
             source_in = gr.File(
@@ -1595,9 +1643,9 @@ def launch_fast_ui(share: bool = True) -> None:
                 minimum=100,
                 maximum=600,
                 step=50,
-                value=int(saved_cfg.get("segment_frames", 250)),
+                value=int(saved_cfg.get("segment_frames", 150)),
                 label="Ukuran Segmen Sementara (Frame)",
-                info="Disimpan sementara di Drive & otomatis terhapus setelah hasil akhir selesai.",
+                info="150 frame (~5-6 detik) cepat tersimpan ke Drive tiap segmen agar tahan disconnect.",
             )
             fresh_start_in = gr.Checkbox(
                 value=False,
@@ -1616,8 +1664,15 @@ def launch_fast_ui(share: bool = True) -> None:
         output_file_box = gr.File(label="Download Hasil")
 
         clear_history_btn.click(
-            fn=reset_all_history,
-            outputs=[source_in, target_in, active_faces_gallery, resume_info_box],
+            fn=reset_all_history_and_outputs,
+            outputs=[
+                source_in,
+                target_in,
+                active_faces_gallery,
+                output_file_box,
+                resume_info_box,
+                preview_status,
+            ],
         )
 
         def on_source_changed(src_path):
@@ -1737,7 +1792,7 @@ def main() -> None:
     parser.add_argument("--eye-expr", type=float, default=0.35)
     parser.add_argument("--temporal-smooth", action="store_true")
     parser.add_argument("--top-sharp-fsz", action="store_true")
-    parser.add_argument("--segment-frames", type=int, default=250)
+    parser.add_argument("--segment-frames", type=int, default=150)
     parser.add_argument("--fresh-start", action="store_true")
     args = parser.parse_args()
 
