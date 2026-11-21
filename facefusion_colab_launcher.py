@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -42,21 +43,53 @@ def extract_fsz_archives() -> None:
         print(f"[FACESET] {fsz.name} diekstrak ({count} foto sudut wajah) -> {target_sub}", flush=True)
 
 
+def patch_requirements_for_py313() -> None:
+    """Melepas pin versi ketat pada paket C/C++ agar memakai prebuilt wheel Python 3.13 di Colab."""
+    req_file = WORK_DIR / "requirements.txt"
+    if not req_file.exists():
+        return
+
+    lines = req_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+    patched = []
+    relax_pkgs = ("onnx", "onnxruntime", "numpy", "scipy", "opencv-python", "tqdm", "psutil", "gradio")
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            patched.append(line)
+            continue
+
+        pkg_name = re.split(r"[=<>!~;\[]", stripped)[0].strip().lower()
+        if pkg_name in ("onnxruntime", "onnxruntime-gpu"):
+            continue
+        if pkg_name in relax_pkgs:
+            patched.append(pkg_name)
+        else:
+            patched.append(line)
+
+    req_file.write_text("\n".join(patched) + "\n", encoding="utf-8")
+    print("[PATCH] requirements.txt disesuaikan untuk Python 3.13.", flush=True)
+
+
 def setup_facefusion() -> None:
     os.chdir("/content")
     if not WORK_DIR.exists():
-        print("[SETUP] Mengunduh repositori FaceFusion...", flush=True)
-        run_cmd(f"git clone https://github.com/facefusion/facefusion.git --branch 3.1.1 --single-branch {WORK_DIR}")
+        print("[SETUP] Mengunduh FaceFusion 3.9.2...", flush=True)
+        rc = run_cmd(f"git clone https://github.com/facefusion/facefusion.git --branch 3.9.2 --single-branch {WORK_DIR}")
+        if rc != 0:
+            raise RuntimeError("Gagal melakukan git clone FaceFusion 3.9.2.")
 
     os.chdir(WORK_DIR)
+    patch_requirements_for_py313()
 
-    # Pasang dependensi GPU CUDA (onnxruntime-gpu) & FaceFusion
-    print("[SETUP] Menginstal dependensi FaceFusion & CUDA GPU...", flush=True)
-    run_cmd(f"{sys.executable} install.py --onnxruntime cuda --skip-conda")
+    print("[SETUP] Menginstal onnx, onnxruntime-gpu, dan dependensi FaceFusion 3.9.2...", flush=True)
+    run_cmd(f"{sys.executable} -m pip install -q --upgrade pip wheel setuptools")
+    run_cmd(f"{sys.executable} -m pip install -q onnx onnxruntime-gpu")
+    run_cmd(f"{sys.executable} -m pip install -q -r requirements.txt")
 
 
 def patch_gradio_share() -> None:
-    """Memastikan UI FaceFusion membuka tautan publik gradio.live agar bisa diakses dari browser HP/Colab."""
+    """Mengaktifkan tautan publik gradio.live agar UI bisa dibuka dari browser HP/Colab."""
     ui_core = WORK_DIR / "facefusion" / "uis" / "core.py"
     if not ui_core.exists():
         return
@@ -72,7 +105,7 @@ def main() -> None:
     setup_facefusion()
     patch_gradio_share()
     os.chdir(WORK_DIR)
-    print("\n[START] Menjalankan FaceFusion UI dengan akselerasi CUDA...", flush=True)
+    print("\n[START] Menjalankan FaceFusion 3.9.2 UI dengan akselerasi CUDA...", flush=True)
     run_cmd(f"{sys.executable} facefusion.py run --execution-providers cuda")
 
 
