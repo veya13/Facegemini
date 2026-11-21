@@ -144,26 +144,49 @@ def compute_job_id(source_file: str, target_file: str) -> str:
 
 
 class DriveSegmentCheckpoint:
-    """Menyimpan segmen sementara & progres di Google Drive agar tahan disconnect, lalu menghapusnya setelah hasil akhir jadi."""
+    """Menyimpan input persisten, segmen sementara & progres di Google Drive agar tahan disconnect, lalu menghapus segmen setelah hasil akhir jadi."""
 
     def __init__(self, workspace_root: Optional[Path] = None):
         root = workspace_root or DEFAULT_DRIVE_WORKSPACE
-        # Fallback aman jika Drive belum di-mount
         if not root.parent.exists() and Path("/content/drive/MyDrive").exists():
             root = DEFAULT_DRIVE_WORKSPACE
         self.root = root
         self.temp_root = self.root / "temp_segments"
         self.output_dir = self.root / "output"
+        self.inputs_dir = self.root / "persisted_inputs"
         try:
             self.temp_root.mkdir(parents=True, exist_ok=True)
             self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.inputs_dir.mkdir(parents=True, exist_ok=True)
             self.enabled = True
         except Exception:
             self.temp_root = Path("output/temp_segments")
             self.output_dir = Path("output")
+            self.inputs_dir = Path("output/persisted_inputs")
             self.temp_root.mkdir(parents=True, exist_ok=True)
             self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.inputs_dir.mkdir(parents=True, exist_ok=True)
             self.enabled = False
+
+    def persist_input_file(self, file_path: Optional[str], prefix: str = "input") -> Optional[str]:
+        if not file_path:
+            return None
+        src = Path(file_path)
+        if not src.exists() or not src.is_file():
+            return None
+        try:
+            self.inputs_dir.mkdir(parents=True, exist_ok=True)
+            if src.resolve().parent == self.inputs_dir.resolve():
+                return str(src.resolve())
+            stat = src.stat()
+            sig = hashlib.md5(f"{src.name}|{stat.st_size}|{stat.st_mtime}".encode("utf-8")).hexdigest()[:8]
+            safe_name = "".join(c if c.isalnum() or c in (".", "_", "-") else "_" for c in src.name)
+            dst = self.inputs_dir / f"{prefix}_{sig}_{safe_name}"
+            if not dst.exists() or dst.stat().st_size != stat.st_size:
+                shutil.copy2(str(src), str(dst))
+            return str(dst)
+        except Exception:
+            return str(src) if src.exists() else None
 
     def job_dir(self, job_id: str) -> Path:
         d = self.temp_root / job_id
@@ -247,7 +270,6 @@ class DriveSegmentCheckpoint:
             shutil.move(str(merged_raw), str(final_out))
 
         if final_out.exists() and final_out.stat().st_size > 0:
-            # Hapus otomatis seluruh file segmen sementara & state setelah hasil akhir sukses dibuat
             self.clear_job(job_id)
             return True, str(final_out)
 
@@ -906,7 +928,8 @@ def fsz_build_and_apply(
     if not clean_name:
         clean_name = "custom_faceset"
 
-    out_dir = Path("output")
+    ckpt_mgr = get_checkpoint_mgr()
+    out_dir = ckpt_mgr.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     fsz_path = out_dir / f"{clean_name}.fsz"
 
@@ -916,12 +939,13 @@ def fsz_build_and_apply(
             if p.exists():
                 zf.write(p, arcname=f"face_{i:03d}{p.suffix.lower()}")
 
-    preview_list, _ = inspect_source_gallery(str(fsz_path))
+    persisted_fsz = ckpt_mgr.persist_input_file(str(fsz_path), prefix="src") or str(fsz_path)
+    preview_list, _ = inspect_source_gallery(persisted_fsz)
     return (
-        str(fsz_path),
-        str(fsz_path),
+        persisted_fsz,
+        persisted_fsz,
         preview_list,
-        f"Faceset '{fsz_path.name}' selesai dibuat ({len(items)} wajah) & langsung dipasang sebagai Sumber Wajah!",
+        f"Faceset '{fsz_path.name}' selesai dibuat ({len(items)} wajah) di Drive & langsung dipasang sebagai Sumber Wajah!",
     )
 
 
@@ -1063,6 +1087,10 @@ def preview_single_frame(
         if not source_file or not target_file:
             return None, "Unggah / buat Sumber Wajah (.jpg/.png/.fsz) dan Target, lalu klik Cek Preview."
 
+        ckpt_mgr = get_checkpoint_mgr()
+        source_file = ckpt_mgr.persist_input_file(source_file, prefix="src") or source_file
+        target_file = ckpt_mgr.persist_input_file(target_file, prefix="tgt") or target_file
+
         app = get_face_analyser(det_size=int(det_size))
         swapper = get_swapper(swapper_model)
         enhancer_obj = get_enhancer(enhancer)
@@ -1161,22 +1189,25 @@ def run_render_full(
     if not source_file or not target_file:
         raise ValueError("Sumber wajah dan target wajib diisi.")
 
+    ckpt_mgr = get_checkpoint_mgr()
+    persisted_src = ckpt_mgr.persist_input_file(source_file, prefix="src") or source_file
+    persisted_tgt = ckpt_mgr.persist_input_file(target_file, prefix="tgt") or target_file
+
     app = get_face_analyser(det_size=int(det_size))
     swapper = get_swapper(swapper_model)
     enhancer_obj = get_enhancer(enhancer)
     xseg_obj = get_xseg() if use_xseg else None
     parser_obj = get_face_parser() if use_face_parser else None
-    src_face = load_source_face(source_file, app, top_sharp_only=bool(top_sharp_fsz))
+    src_face = load_source_face(persisted_src, app, top_sharp_only=bool(top_sharp_fsz))
     src_cnt = int(_CACHE.get("source_count", 1))
 
-    target_path = Path(target_file)
-    ckpt_mgr = get_checkpoint_mgr()
+    target_path = Path(persisted_tgt)
     out_dir = ckpt_mgr.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
     video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
     if target_path.suffix.lower() in video_exts:
-        job_id = compute_job_id(source_file, target_file)
+        job_id = compute_job_id(persisted_src, persisted_tgt)
         job_dir = ckpt_mgr.job_dir(job_id)
 
         cap = cv2.VideoCapture(str(target_path))
@@ -1190,8 +1221,8 @@ def run_render_full(
         cap.release()
 
         settings_snapshot = {
-            "source_file": source_file,
-            "target_file": target_file,
+            "source_file": persisted_src,
+            "target_file": persisted_tgt,
             "swapper_model": swapper_model,
             "swap_weight": float(swap_weight),
             "enhancer": enhancer,
@@ -1321,7 +1352,6 @@ def run_render_full(
         if ok:
             return final_path_str, f"Selesai ({total} frame, {src_cnt} wajah digabung) -> {final_path_str} (segmen temp dibersihkan)"
 
-        # Fallback jika penggabungan segmen gagal
         out_path = out_dir / "hasil_swap.mp4"
         return str(out_path), f"Selesai sebagian/gagal gabung ({final_path_str})"
 
@@ -1365,6 +1395,19 @@ def launch_fast_ui(share: bool = True) -> None:
     saved_job = ckpt_mgr.find_latest_unfinished()
     saved_cfg = saved_job.get("settings", {}) if saved_job else {}
 
+    def _valid_existing_file(p: Optional[str]) -> Optional[str]:
+        if not p:
+            return None
+        try:
+            if Path(p).is_file():
+                return str(p)
+        except Exception:
+            pass
+        return None
+
+    init_source_file = _valid_existing_file(saved_cfg.get("source_file"))
+    init_target_file = _valid_existing_file(saved_cfg.get("target_file"))
+
     def initial_resume_banner() -> str:
         if saved_job:
             done_f = int(saved_job.get("last_completed_idx", 0))
@@ -1373,7 +1416,7 @@ def launch_fast_ui(share: bool = True) -> None:
                 f"Auto-Resume aktif: terdeteksi progres sampai frame {done_f}/{tot_f} di Google Drive. "
                 f"Setelan dimuat otomatis; klik 'Render Video Lengkap' untuk menyambung tanpa setting ulang."
             )
-        return "Siap. Segmen sementara disimpan ke Drive dan otomatis dihapus setelah hasil akhir selesai."
+        return "Siap. File input, segmen sementara & hasil akhir disimpan ke Drive; segmen terhapus otomatis saat selesai."
 
     with gr.Blocks(title="Fast FaceSwap CUDA UI + Faceset Studio") as demo:
         gr.Markdown(f"### Fast FaceSwap Pro UI & Faceset Studio — **{gpu_status}**")
@@ -1383,12 +1426,12 @@ def launch_fast_ui(share: bool = True) -> None:
             source_in = gr.File(
                 label="Sumber Wajah Aktif (.jpg / .png / .fsz)",
                 type="filepath",
-                value=saved_cfg.get("source_file") if saved_cfg.get("source_file") else None,
+                value=init_source_file,
             )
             target_in = gr.File(
                 label="Video atau Foto Target",
                 type="filepath",
-                value=saved_cfg.get("target_file") if saved_cfg.get("target_file") else None,
+                value=init_target_file,
             )
 
         active_faces_gallery = gr.Gallery(
@@ -1557,10 +1600,17 @@ def launch_fast_ui(share: bool = True) -> None:
         preview_status = gr.Textbox(label="Status Render / Preview", interactive=False)
         output_file_box = gr.File(label="Download Hasil")
 
+        def on_source_changed(src_path):
+            persisted = ckpt_mgr.persist_input_file(src_path, prefix="src") if src_path else None
+            gallery_items, info_msg = inspect_source_gallery(persisted)
+            if persisted and persisted != src_path:
+                return persisted, gallery_items, info_msg
+            return gr.update(), gallery_items, info_msg
+
         source_in.change(
-            fn=inspect_source_gallery,
+            fn=on_source_changed,
             inputs=[source_in],
-            outputs=[active_faces_gallery, active_faces_info],
+            outputs=[source_in, active_faces_gallery, active_faces_info],
         )
 
         def on_gallery_select(evt: gr.SelectData):
@@ -1614,10 +1664,14 @@ def launch_fast_ui(share: bool = True) -> None:
         ]
 
         def on_target_uploaded(tgt):
-            total = get_video_frame_count(tgt)
-            return gr.update(minimum=0, maximum=max(0, total - 1), value=0), f"Video siap ({total} frame)."
+            if not tgt:
+                return gr.update(), gr.update(minimum=0, maximum=100, value=0), "Belum ada target."
+            persisted = ckpt_mgr.persist_input_file(tgt, prefix="tgt") or tgt
+            total = get_video_frame_count(persisted)
+            upd_file = persisted if persisted != tgt else gr.update()
+            return upd_file, gr.update(minimum=0, maximum=max(0, total - 1), value=0), f"Video siap ({total} frame) & tersimpan di Drive."
 
-        target_in.change(fn=on_target_uploaded, inputs=[target_in], outputs=[frame_slider, preview_status])
+        target_in.change(fn=on_target_uploaded, inputs=[target_in], outputs=[target_in, frame_slider, preview_status])
         frame_slider.release(fn=preview_single_frame, inputs=all_params, outputs=[preview_img, preview_status])
         preview_btn.click(fn=preview_single_frame, inputs=all_params, outputs=[preview_img, preview_status])
 
