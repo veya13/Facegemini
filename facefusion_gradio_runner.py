@@ -7,6 +7,7 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -30,7 +31,6 @@ MODEL_URLS = {
     ],
 }
 
-# Cache global agar model tidak dimuat berulang kali dan tidak membebani RAM/VRAM
 _CACHE: Dict[str, object] = {
     "analyser": None,
     "det_size": None,
@@ -149,6 +149,19 @@ def get_enhancer(enhancer_choice: str) -> Optional[OnnxFaceEnhancer]:
     return obj
 
 
+def _make_merged_face_obj(base_face, mean_emb: np.ndarray):
+    """Membungkus embedding rata-rata tanpa menabrak read-only property normed_embedding pada insightface.Face."""
+    norm = float(np.linalg.norm(mean_emb))
+    normed = (mean_emb / norm) if norm > 0 else mean_emb
+    return SimpleNamespace(
+        bbox=getattr(base_face, "bbox", None),
+        kps=getattr(base_face, "kps", None),
+        det_score=getattr(base_face, "det_score", 1.0),
+        embedding=mean_emb.astype(np.float32),
+        normed_embedding=normed.astype(np.float32),
+    )
+
+
 def load_source_face(source_file: str, app):
     """Mendukung satu foto (.jpg/.png) maupun arsip faceset (.fsz / .zip) dengan rata-rata embedding multi-sudut."""
     src_path = Path(source_file)
@@ -163,36 +176,46 @@ def load_source_face(source_file: str, app):
         with tempfile.TemporaryDirectory() as tmpdir:
             with zipfile.ZipFile(src_path, "r") as zf:
                 zf.extractall(tmpdir)
-            for root, _, files in os.walk(tmpdir):
-                for fname in sorted(files):
-                    fpath = Path(root) / fname
-                    if fpath.suffix.lower() not in img_exts:
-                        continue
-                    img = cv2.imread(str(fpath))
-                    if img is None:
-                        continue
-                    faces = app.get(img)
-                    if faces:
-                        best = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-                        detected_faces.append(best)
+            all_imgs = [
+                Path(root) / fname
+                for root, _, files in os.walk(tmpdir)
+                for fname in sorted(files)
+                if (Path(root) / fname).suffix.lower() in img_exts
+            ]
+            # Ambil maksimal 30 sampel sudut merata agar ringan di RAM Colab
+            if len(all_imgs) > 30:
+                step = len(all_imgs) / 30.0
+                all_imgs = [all_imgs[int(i * step)] for i in range(30)]
 
+            for fpath in all_imgs:
+                img = cv2.imread(str(fpath))
+                if img is None:
+                    continue
+                faces = app.get(img)
+                if faces:
+                    best = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+                    detected_faces.append(best)
+
+        gc.collect()
         if not detected_faces:
             raise RuntimeError("Tidak ada wajah yang terdeteksi di dalam file faceset (.fsz).")
 
-        # Gunakan wajah pertama sebagai kerangka objek, lalu gabungkan rata-rata embedding seluruh sudut
         base_face = detected_faces[0]
-        embeddings = [f.normed_embedding for f in detected_faces if hasattr(f, "normed_embedding") and f.normed_embedding is not None]
-        if embeddings:
-            mean_emb = np.mean(np.stack(embeddings, axis=0), axis=0)
-            norm = np.linalg.norm(mean_emb)
-            if norm > 0:
-                mean_emb = mean_emb / norm
-            base_face.embedding = mean_emb
-            base_face.normed_embedding = mean_emb
-        print(f"[FACESET] Berhasil memuat {len(detected_faces)} sudut wajah dari {src_path.name}")
+        raw_embs = [
+            f.normed_embedding
+            for f in detected_faces
+            if getattr(f, "normed_embedding", None) is not None
+        ]
+        if raw_embs:
+            mean_emb = np.mean(np.stack(raw_embs, axis=0), axis=0)
+            merged_face = _make_merged_face_obj(base_face, mean_emb)
+        else:
+            merged_face = base_face
+
+        print(f"[FACESET] Berhasil memuat {len(detected_faces)} sudut wajah dari {src_path.name}", flush=True)
         _CACHE["source_key"] = cache_key
-        _CACHE["source_face"] = base_face
-        return base_face
+        _CACHE["source_face"] = merged_face
+        return merged_face
 
     src_img = cv2.imread(str(src_path))
     if src_img is None:
@@ -304,50 +327,53 @@ def preview_single_frame(
     mask_blur: int,
     blend_alpha: float,
 ) -> Tuple[Optional[np.ndarray], str]:
-    if not source_file or not target_file:
-        return None, "Unggah Sumber Wajah (.jpg/.png/.fsz) dan Target terlebih dahulu untuk melihat Live Preview."
+    try:
+        if not source_file or not target_file:
+            return None, "Unggah Sumber Wajah (.jpg/.png/.fsz) dan Target, lalu geser slider / klik Cek Preview."
 
-    app = get_face_analyser(det_size=int(det_size))
-    swapper = get_swapper()
-    enhancer_obj = get_enhancer(enhancer)
-    src_face = load_source_face(source_file, app)
+        app = get_face_analyser(det_size=int(det_size))
+        swapper = get_swapper()
+        enhancer_obj = get_enhancer(enhancer)
+        src_face = load_source_face(source_file, app)
 
-    target_path = Path(target_file)
-    video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
-    if target_path.suffix.lower() in video_exts:
-        cap = cv2.VideoCapture(str(target_path))
-        if not cap.isOpened():
-            return None, "Gagal membuka file video target."
-        total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
-        safe_idx = max(0, min(total - 1, int(frame_index)))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, safe_idx)
-        ret, frame = cap.read()
-        cap.release()
-        if not ret or frame is None:
-            return None, f"Gagal membaca frame ke-{safe_idx}."
-        status = f"Live Preview Frame {safe_idx + 1} / {total}"
-    else:
-        frame = cv2.imread(str(target_path))
-        if frame is None:
-            return None, "Gagal membaca gambar target."
-        status = "Live Preview Gambar Target"
+        target_path = Path(target_file)
+        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+        if target_path.suffix.lower() in video_exts:
+            cap = cv2.VideoCapture(str(target_path))
+            if not cap.isOpened():
+                return None, "Gagal membuka file video target."
+            total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+            safe_idx = max(0, min(total - 1, int(frame_index)))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, safe_idx)
+            ret, frame = cap.read()
+            cap.release()
+            if not ret or frame is None:
+                return None, f"Gagal membaca frame ke-{safe_idx}."
+            status = f"Live Preview Frame {safe_idx + 1} / {total}"
+        else:
+            frame = cv2.imread(str(target_path))
+            if frame is None:
+                return None, "Gagal membaca gambar target."
+            status = "Live Preview Gambar Target"
 
-    out_frame = frame.copy()
-    faces = select_target_faces(app.get(frame), mode=face_mode)
-    for face in faces:
-        out_frame = process_face_on_frame(
-            out_frame,
-            face,
-            src_face,
-            swapper,
-            enhancer_obj,
-            enhancer_blend=float(enhancer_blend),
-            mask_blur=int(mask_blur),
-            blend_alpha=float(blend_alpha),
-        )
+        out_frame = frame.copy()
+        faces = select_target_faces(app.get(frame), mode=face_mode)
+        for face in faces:
+            out_frame = process_face_on_frame(
+                out_frame,
+                face,
+                src_face,
+                swapper,
+                enhancer_obj,
+                enhancer_blend=float(enhancer_blend),
+                mask_blur=int(mask_blur),
+                blend_alpha=float(blend_alpha),
+            )
 
-    rgb_preview = cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB)
-    return rgb_preview, status
+        rgb_preview = cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB)
+        return rgb_preview, status
+    except Exception as exc:
+        return None, f"Error Preview: {exc}"
 
 
 def run_swap_task(
@@ -409,8 +435,7 @@ def run_swap_task(
                 )
             writer.write(out_frame)
 
-            # Update progress & bersihkan memori secara berkala agar Colab tidak disconnect
-            if idx % 25 == 0 or idx == total:
+            if idx % 20 == 0 or idx == total:
                 gc.collect()
                 if progress is not None:
                     progress((idx, total), desc=f"Merender frame {idx}/{total}")
@@ -503,6 +528,7 @@ def launch_gradio_ui(share: bool = True) -> None:
                     value=0,
                     label="Geser Frame untuk Cek Hasil (Live Preview)",
                 )
+                preview_btn = gr.Button("Cek / Refresh Preview Frame", variant="secondary")
                 preview_status = gr.Textbox(label="Info Preview", interactive=False)
                 run_btn = gr.Button("Render Video Lengkap", variant="primary")
                 output_file_box = gr.File(label="Hasil Video/Foto Lengkap")
@@ -520,44 +546,29 @@ def launch_gradio_ui(share: bool = True) -> None:
             blend_alpha_in,
         ]
 
-        # Update batas slider saat video target diunggah, lalu render frame awal
-        def on_target_change(src, tgt, enh, eblend, fmode, dsz, mblur, balpha):
+        # Saat video target diunggah, cukup update jumlah maksimum frame slider tanpa memicu crash paralel
+        def on_target_uploaded(tgt):
             total = get_video_frame_count(tgt)
             max_idx = max(0, total - 1)
-            img, msg = preview_single_frame(src, tgt, 0, enh, eblend, fmode, dsz, mblur, balpha)
-            return gr.update(minimum=0, maximum=max_idx, value=0), img, msg
+            return gr.update(minimum=0, maximum=max_idx, value=0), f"Target siap ({total} frame). Geser slider atau klik Cek Preview."
 
         target_in.change(
-            fn=on_target_change,
-            inputs=[
-                source_in,
-                target_in,
-                enhancer_in,
-                enhancer_blend_in,
-                face_mode_in,
-                det_size_in,
-                mask_blur_in,
-                blend_alpha_in,
-            ],
-            outputs=[frame_slider, preview_img, preview_status],
+            fn=on_target_uploaded,
+            inputs=[target_in],
+            outputs=[frame_slider, preview_status],
         )
 
-        # Otomatis perbarui Live Preview saat slider frame atau setelan digeser
-        for trigger in (
-            source_in.change,
-            frame_slider.release,
-            enhancer_in.change,
-            enhancer_blend_in.release,
-            face_mode_in.change,
-            det_size_in.release,
-            mask_blur_in.release,
-            blend_alpha_in.release,
-        ):
-            trigger(
-                fn=preview_single_frame,
-                inputs=preview_inputs,
-                outputs=[preview_img, preview_status],
-            )
+        # Trigger preview saat slider dilepas atau tombol Cek Preview ditekan
+        frame_slider.release(
+            fn=preview_single_frame,
+            inputs=preview_inputs,
+            outputs=[preview_img, preview_status],
+        )
+        preview_btn.click(
+            fn=preview_single_frame,
+            inputs=preview_inputs,
+            outputs=[preview_img, preview_status],
+        )
 
         def on_render_full(src, tgt, enh, eblend, fmode, dsz, mblur, balpha, progress=gr.Progress()):
             res_path = run_swap_task(
@@ -588,7 +599,7 @@ def launch_gradio_ui(share: bool = True) -> None:
             outputs=[output_file_box, status_box],
         )
 
-    demo.queue().launch(share=share, debug=False)
+    demo.queue(max_size=5).launch(share=share, debug=False)
 
 
 def parse_args(argv: Optional[List[str]] = None):
