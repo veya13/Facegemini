@@ -1,1435 +1,570 @@
 import argparse
 import gc
+import hashlib
+import json
 import os
 import shutil
 import subprocess
-import sys
-import tempfile
-import zipfile
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
+import gradio as gr
+import insightface
+from insightface.app import FaceAnalysis
 import numpy as np
+from PIL import Image
 
-MODELS_DIR = Path("models")
-FACESET_WORK_DIR = Path("faceset_workspace")
+try:
+    import torch
+except Exception:
+    torch = None
 
-SWAPPER_URLS = {
-    "inswapper_128_fp16": [
-        "https://huggingface.co/facefusion/models-3.0.0/resolve/main/inswapper_128_fp16.onnx",
-        "https://huggingface.co/countfloyd/deepfake/resolve/main/inswapper_128_fp16.onnx",
-    ],
-    "inswapper_128": [
-        "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx",
-        "https://huggingface.co/deepinsight/inswapper/resolve/main/inswapper_128.onnx",
-    ],
-    "hyperswap_1a_256": [
-        "https://huggingface.co/facefusion/models-3.3.0/resolve/main/hyperswap_1a_256.onnx",
-        "https://huggingface.co/facefusion/models-3.0.0/resolve/main/hyperswap_1a_256.onnx",
-    ],
-    "alphaface_256": [
-        "https://huggingface.co/facefusion/models-3.3.0/resolve/main/alphaface_256.onnx",
-        "https://huggingface.co/facefusion/models-3.0.0/resolve/main/alphaface_256.onnx",
-    ],
-    "ghost_1_256": [
-        "https://huggingface.co/facefusion/models-3.0.0/resolve/main/ghost_1_256.onnx",
-    ],
-    "simswap_256": [
-        "https://huggingface.co/facefusion/models-3.0.0/resolve/main/simswap_256.onnx",
-    ],
-}
 
-AUX_MODEL_URLS = {
-    "xseg.onnx": [
-        "https://huggingface.co/countfloyd/deepfake/resolve/main/xseg.onnx",
-        "https://huggingface.co/facefusion/models-3.0.0/resolve/main/xseg_1.onnx",
-    ],
-    "face_parser.onnx": [
-        "https://huggingface.co/facefusion/models-3.0.0/resolve/main/face_parser.onnx",
-        "https://huggingface.co/countfloyd/deepfake/resolve/main/face_parser.onnx",
-    ],
-    "restoreformer_plus_plus.onnx": [
-        "https://huggingface.co/countfloyd/deepfake/resolve/main/restoreformer_plus_plus.onnx",
-    ],
-    "GPEN-BFR-512.onnx": [
-        "https://huggingface.co/countfloyd/deepfake/resolve/main/GPEN-BFR-512.onnx",
-    ],
-    "CodeFormerv0.1.onnx": [
-        "https://huggingface.co/countfloyd/deepfake/resolve/main/CodeFormerv0.1.onnx",
-    ],
-}
+def free_memory(deep_cuda: bool = False):
+    gc.collect()
+    if torch is not None and torch.cuda.is_available():
+        try:
+            if deep_cuda:
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
-_CACHE: Dict[str, object] = {
-    "analyser": None,
-    "det_size": None,
-    "swapper_name": None,
-    "swapper_obj": None,
-    "enhancer_name": None,
-    "enhancer_obj": None,
-    "xseg_obj": None,
-    "parser_obj": None,
-    "source_key": None,
-    "source_face": None,
-    "source_count": 0,
-}
 
-ARCFACE_DST = np.array(
-    [
-        [38.2946, 51.6963],
-        [73.5318, 51.5014],
-        [56.0252, 71.7366],
-        [41.5493, 92.3655],
-        [70.7299, 92.2041],
-    ],
-    dtype=np.float32,
-)
-
-
-def run_cmd(cmd: str) -> int:
-    return subprocess.call(cmd, shell=True)
-
-
-def ensure_packages(use_gradio: bool) -> None:
-    pkgs = ["insightface==0.7.3", "onnxruntime-gpu", "opencv-python", "scikit-image"]
-    if use_gradio:
-        pkgs.extend(["gradio==5.13.0", "pydantic==2.10.6"])
-    print("[SETUP] Memastikan paket ringan & CUDA ONNX terpasang...", flush=True)
-    run_cmd(f"{sys.executable} -m pip install -q " + " ".join(pkgs))
-
-
-def download_from_list(filename: str, urls: List[str], min_bytes: int = 5_000_000) -> Optional[Path]:
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    dest = MODELS_DIR / filename
-    if dest.exists() and dest.stat().st_size >= min_bytes:
-        return dest
-
-    for url in urls:
-        print(f"[UNDUH] {url}", flush=True)
-        rc = run_cmd(f'wget -q --show-progress "{url}" -O "{dest}"')
-        if rc == 0 and dest.exists() and dest.stat().st_size >= min_bytes:
-            print(f"[SUKSES] Tersimpan: {dest}", flush=True)
-            return dest
-        if dest.exists():
-            dest.unlink()
-    return None
-
-
-def _rotate_points_back(pts: np.ndarray, angle: int, orig_w: int, orig_h: int) -> np.ndarray:
-    if angle == 0:
-        return pts
-    out = pts.copy()
-    if angle == 90:
-        out[:, 0] = pts[:, 1]
-        out[:, 1] = (orig_h - 1) - pts[:, 0]
-    elif angle == 270:
-        out[:, 0] = (orig_w - 1) - pts[:, 1]
-        out[:, 1] = pts[:, 0]
-    elif angle == 180:
-        out[:, 0] = (orig_w - 1) - pts[:, 0]
-        out[:, 1] = (orig_h - 1) - pts[:, 1]
-    return out
-
-
-def detect_faces_angle_aware(app, frame: np.ndarray, enable_rotation: bool = True):
-    faces = app.get(frame)
-    if faces or not enable_rotation:
-        return faces
-
-    h, w = frame.shape[:2]
-    rot_configs = [
-        (90, cv2.ROTATE_90_CLOCKWISE),
-        (270, cv2.ROTATE_90_COUNTERCLOCKWISE),
-    ]
-    for angle, rot_flag in rot_configs:
-        rot_img = cv2.rotate(frame, rot_flag)
-        rot_faces = app.get(rot_img)
-        if rot_faces:
-            restored_faces = []
-            for f in rot_faces:
-                x1, y1, x2, y2 = f.bbox[:4]
-                corners = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
-                orig_corners = _rotate_points_back(corners, angle, w, h)
-                new_bbox = np.array(
-                    [
-                        np.min(orig_corners[:, 0]),
-                        np.min(orig_corners[:, 1]),
-                        np.max(orig_corners[:, 0]),
-                        np.max(orig_corners[:, 1]),
-                    ],
-                    dtype=np.float32,
-                )
-                new_kps = _rotate_points_back(np.array(f.kps, dtype=np.float32), angle, w, h)
-                restored_faces.append(
-                    SimpleNamespace(
-                        bbox=new_bbox,
-                        kps=new_kps,
-                        det_score=getattr(f, "det_score", 0.9),
-                        embedding=getattr(f, "embedding", None),
-                        normed_embedding=getattr(f, "normed_embedding", None),
-                    )
-                )
-            return restored_faces
-    return []
-
-
-class TemporalFaceTracker:
-    def __init__(self, alpha: float = 0.65, max_hold_frames: int = 3):
-        self.alpha = float(np.clip(alpha, 0.2, 1.0))
-        self.max_hold = int(max_hold_frames)
-        self.prev_kps: Optional[np.ndarray] = None
-        self.prev_bbox: Optional[np.ndarray] = None
-        self.missed_count: int = 0
-
-    def update(self, faces: List) -> List:
-        if faces:
-            largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-            curr_kps = np.array(largest.kps, dtype=np.float32)
-            curr_bbox = np.array(largest.bbox[:4], dtype=np.float32)
-
-            if self.prev_kps is not None:
-                dist = float(np.mean(np.linalg.norm(curr_kps - self.prev_kps, axis=1)))
-                face_w = max(20.0, float(curr_bbox[2] - curr_bbox[0]))
-                if dist < face_w * 0.45:
-                    curr_kps = self.alpha * curr_kps + (1.0 - self.alpha) * self.prev_kps
-                    curr_bbox = self.alpha * curr_bbox + (1.0 - self.alpha) * self.prev_bbox
-
-            self.prev_kps = curr_kps
-            self.prev_bbox = curr_bbox
-            self.missed_count = 0
-
-            return [
-                SimpleNamespace(
-                    bbox=curr_bbox,
-                    kps=curr_kps,
-                    det_score=getattr(largest, "det_score", 0.9),
-                    embedding=getattr(largest, "embedding", None),
-                    normed_embedding=getattr(largest, "normed_embedding", None),
-                )
-            ]
-
-        if self.prev_kps is not None and self.missed_count < self.max_hold:
-            self.missed_count += 1
-            return [
-                SimpleNamespace(
-                    bbox=self.prev_bbox,
-                    kps=self.prev_kps,
-                    det_score=0.5,
-                    embedding=None,
-                    normed_embedding=None,
-                )
-            ]
-
-        self.prev_kps = None
-        self.prev_bbox = None
-        return []
-
-
-def align_face_crop(image: np.ndarray, kps: np.ndarray, crop_size: int) -> Tuple[np.ndarray, np.ndarray]:
-    scale = crop_size / 112.0
-    dst = ARCFACE_DST * scale
-    if crop_size == 256:
-        dst = (ARCFACE_DST - 56.0) * (crop_size / 128.0) + (crop_size / 2.0)
-    M, _ = cv2.estimateAffinePartial2D(kps.astype(np.float32), dst, method=cv2.LMEDS)
-    aligned = cv2.warpAffine(image, M, (crop_size, crop_size), flags=cv2.INTER_CUBIC, borderValue=0.0)
-    return aligned, M
-
-
-def match_color_lab(source_crop: np.ndarray, target_crop: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    src_lab = cv2.cvtColor(source_crop, cv2.COLOR_BGR2LAB).astype(np.float32)
-    tgt_lab = cv2.cvtColor(target_crop, cv2.COLOR_BGR2LAB).astype(np.float32)
-
-    valid = mask > 0.35
-    if np.count_nonzero(valid) < 50:
-        return source_crop
-
-    for ch in range(3):
-        s_vals = src_lab[:, :, ch][valid]
-        t_vals = tgt_lab[:, :, ch][valid]
-        s_mean, s_std = float(np.mean(s_vals)), float(np.std(s_vals)) + 1e-5
-        t_mean, t_std = float(np.mean(t_vals)), float(np.std(t_vals)) + 1e-5
-        src_lab[:, :, ch] = (src_lab[:, :, ch] - s_mean) * (t_std / s_std) + t_mean
-
-    matched = np.clip(src_lab, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(matched, cv2.COLOR_LAB2BGR)
-
-
-def restore_eye_expression(swapped_crop: np.ndarray, target_crop: np.ndarray, strength: float = 0.35) -> np.ndarray:
-    if strength <= 0.0:
-        return swapped_crop
-
-    h, w = swapped_crop.shape[:2]
-    out = swapped_crop.copy()
-
-    y1, y2 = int(h * 0.32), int(h * 0.54)
-    x1, x2 = int(w * 0.20), int(w * 0.80)
-
-    swap_roi = out[y1:y2, x1:x2]
-    tgt_roi = target_crop[y1:y2, x1:x2]
-    if swap_roi.size == 0:
-        return out
-
-    s_lab = cv2.cvtColor(swap_roi, cv2.COLOR_BGR2LAB).astype(np.float32)
-    t_lab = cv2.cvtColor(tgt_roi, cv2.COLOR_BGR2LAB).astype(np.float32)
-
-    t_l = t_lab[:, :, 0]
-    t_blur = cv2.GaussianBlur(t_l, (0, 0), 2.5)
-    t_detail = t_l - t_blur
-
-    s_lab[:, :, 0] = np.clip(s_lab[:, :, 0] + t_detail * float(np.clip(strength, 0.0, 0.8)), 0, 255)
-    restored_roi = cv2.cvtColor(s_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-
-    mask = np.zeros((y2 - y1, x2 - x1), dtype=np.float32)
-    cv2.ellipse(
-        mask,
-        center=((x2 - x1) // 2, (y2 - y1) // 2),
-        axes=(int((x2 - x1) * 0.45), int((y2 - y1) * 0.42)),
-        angle=0,
-        startAngle=0,
-        endAngle=360,
-        color=1.0,
-        thickness=-1,
-    )
-    mask = cv2.GaussianBlur(mask, (9, 9), 0)[..., None]
-    blended = restored_roi.astype(np.float32) * mask + swap_roi.astype(np.float32) * (1.0 - mask)
-    out[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
-    return out
-
-
-class UniversalOnnxSwapper:
-    def __init__(self, model_path: Path, model_name: str):
-        import onnx
-        import onnxruntime as ort
-
-        self.model_name = model_name
-        self.model_path = model_path
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-
-        self.is_inswapper = "inswapper" in model_name.lower()
-        self.emap = None
-        if self.is_inswapper:
-            try:
-                from onnx import numpy_helper
-                model_proto = onnx.load(str(model_path))
-                self.emap = numpy_helper.to_array(model_proto.graph.initializer[-1])
-            except Exception:
-                self.emap = None
-
-        self.session = ort.InferenceSession(str(model_path), providers=providers)
-        self.inputs = self.session.get_inputs()
-
-        self.crop_size = 128
-        for inp in self.inputs:
-            if len(inp.shape) == 4 and isinstance(inp.shape[2], int):
-                self.crop_size = int(inp.shape[2])
-                break
-
-    def swap_crop(self, aligned_bgr: np.ndarray, src_face) -> np.ndarray:
-        img_rgb = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        if not self.is_inswapper:
-            img_rgb = (img_rgb - 0.5) / 0.5
-        img_tensor = np.transpose(img_rgb, (2, 0, 1))[None, ...].astype(np.float32)
-
-        emb = src_face.normed_embedding.reshape(1, -1).astype(np.float32)
-        if self.is_inswapper and self.emap is not None:
-            latent = np.dot(emb, self.emap)
-            latent /= np.linalg.norm(latent) + 1e-6
-        else:
-            latent = emb
-
-        feed = {}
-        for inp in self.inputs:
-            if len(inp.shape) == 4:
-                feed[inp.name] = img_tensor
-            else:
-                feed[inp.name] = latent.astype(np.float32)
-
-        out = self.session.run(None, feed)[0][0]
-        out = np.transpose(out, (1, 2, 0))
-        if not self.is_inswapper:
-            out = out * 0.5 + 0.5
-        out = np.clip(out * 255.0, 0, 255).astype(np.uint8)
-        return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
-
-
-class XSegMasker:
-    def __init__(self, model_path: Path):
-        import onnxruntime as ort
-
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        self.session = ort.InferenceSession(str(model_path), providers=providers)
-        self.input_name = self.session.get_inputs()[0].name
-        shape = self.session.get_inputs()[0].shape
-        self.size = int(shape[2]) if len(shape) == 4 and isinstance(shape[2], int) else 256
-        self.nhwc = len(shape) == 4 and shape[-1] == 3
-
-    def predict_mask(self, crop_bgr: np.ndarray) -> np.ndarray:
-        h, w = crop_bgr.shape[:2]
-        img = cv2.resize(crop_bgr, (self.size, self.size), interpolation=cv2.INTER_LINEAR)
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        tensor = img_rgb[None, ...] if self.nhwc else np.transpose(img_rgb, (2, 0, 1))[None, ...]
-        out = self.session.run(None, {self.input_name: tensor.astype(np.float32)})[0][0]
-        if out.ndim == 3:
-            out = out[:, :, 0] if out.shape[-1] == 1 else out[0]
-        mask = np.clip(out, 0.0, 1.0).astype(np.float32)
-        return cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
-
-
-class BiSeNetFaceParser:
-    FACE_CLASSES = {1, 2, 3, 4, 5, 10, 11, 12, 13}
-
-    def __init__(self, model_path: Path):
-        import onnxruntime as ort
-
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        self.session = ort.InferenceSession(str(model_path), providers=providers)
-        self.input_name = self.session.get_inputs()[0].name
-        shape = self.session.get_inputs()[0].shape
-        self.size = int(shape[2]) if len(shape) == 4 and isinstance(shape[2], int) else 512
-
-    def predict_face_region_mask(self, crop_bgr: np.ndarray) -> np.ndarray:
-        h, w = crop_bgr.shape[:2]
-        img = cv2.resize(crop_bgr, (self.size, self.size), interpolation=cv2.INTER_LINEAR)
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        norm = (img_rgb - mean) / std
-        tensor = np.transpose(norm, (2, 0, 1))[None, ...].astype(np.float32)
-
-        out = self.session.run(None, {self.input_name: tensor})[0][0]
-        if out.ndim == 3:
-            cls_map = np.argmax(out, axis=0)
-        else:
-            cls_map = out.astype(np.int32)
-
-        mask = np.isin(cls_map, list(self.FACE_CLASSES)).astype(np.float32)
-        mask = cv2.GaussianBlur(mask, (7, 7), 0)
-        return cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
-
-
-class OnnxFaceEnhancer:
-    def __init__(self, model_path: Path, model_type: str):
-        import onnxruntime as ort
-
-        self.model_type = model_type
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        self.session = ort.InferenceSession(str(model_path), providers=providers)
-        self.input_name = self.session.get_inputs()[0].name
-        self.input_shape = self.session.get_inputs()[0].shape
-        self.size = int(self.input_shape[2]) if isinstance(self.input_shape[2], int) else 512
-        self.input_names = [inp.name for inp in self.session.get_inputs()]
-
-    def enhance_crop(self, crop_bgr: np.ndarray) -> np.ndarray:
-        h, w = crop_bgr.shape[:2]
-        img = cv2.resize(crop_bgr, (self.size, self.size), interpolation=cv2.INTER_LINEAR)
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        img_norm = (img_rgb - 0.5) / 0.5
-        tensor = np.transpose(img_norm, (2, 0, 1))[None, ...].astype(np.float32)
-
-        feed = {self.input_name: tensor}
-        if len(self.input_names) > 1:
-            feed[self.input_names[1]] = np.array([0.5], dtype=np.float64)
-
-        out = self.session.run(None, feed)[0][0]
-        out = np.transpose(out, (1, 2, 0))
-        out = np.clip((out * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8)
-        out_bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
-        return cv2.resize(out_bgr, (w, h), interpolation=cv2.INTER_LINEAR)
-
-
-def get_face_analyser(det_size: int = 640):
-    if _CACHE["analyser"] is not None and _CACHE["det_size"] == det_size:
-        return _CACHE["analyser"]
-
-    from insightface.app import FaceAnalysis
-
-    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    app = FaceAnalysis(name="buffalo_l", providers=providers)
-    app.prepare(ctx_id=0, det_size=(det_size, det_size))
-    _CACHE["analyser"] = app
-    _CACHE["det_size"] = det_size
-    return app
-
-
-def get_swapper(model_name: str) -> UniversalOnnxSwapper:
-    if _CACHE["swapper_name"] == model_name and _CACHE["swapper_obj"] is not None:
-        return _CACHE["swapper_obj"]
-
-    urls = SWAPPER_URLS.get(model_name, [])
-    mpath = download_from_list(f"{model_name}.onnx", urls, min_bytes=20_000_000)
-    if mpath is None and model_name != "inswapper_128_fp16":
-        model_name = "inswapper_128_fp16"
-        mpath = download_from_list("inswapper_128_fp16.onnx", SWAPPER_URLS["inswapper_128_fp16"], min_bytes=20_000_000)
-
-    if mpath is None:
-        raise RuntimeError("Gagal mengunduh model Face Swapper ONNX.")
-
-    obj = UniversalOnnxSwapper(mpath, model_name)
-    _CACHE["swapper_name"] = model_name
-    _CACHE["swapper_obj"] = obj
-    return obj
-
-
-def get_xseg() -> Optional[XSegMasker]:
-    if _CACHE["xseg_obj"] is not None:
-        return _CACHE["xseg_obj"]
-    xpath = download_from_list("xseg.onnx", AUX_MODEL_URLS["xseg.onnx"], min_bytes=10_000_000)
-    if xpath is None:
-        return None
-    obj = XSegMasker(xpath)
-    _CACHE["xseg_obj"] = obj
-    return obj
-
-
-def get_face_parser() -> Optional[BiSeNetFaceParser]:
-    if _CACHE["parser_obj"] is not None:
-        return _CACHE["parser_obj"]
-    ppath = download_from_list("face_parser.onnx", AUX_MODEL_URLS["face_parser.onnx"], min_bytes=10_000_000)
-    if ppath is None:
-        return None
-    obj = BiSeNetFaceParser(ppath)
-    _CACHE["parser_obj"] = obj
-    return obj
-
-
-def get_enhancer(enhancer_choice: str) -> Optional[OnnxFaceEnhancer]:
-    if enhancer_choice == "none":
-        return None
-    if _CACHE["enhancer_name"] == enhancer_choice and _CACHE["enhancer_obj"] is not None:
-        return _CACHE["enhancer_obj"]
-
-    fname_map = {
-        "restoreformer++": "restoreformer_plus_plus.onnx",
-        "gpen-512": "GPEN-BFR-512.onnx",
-        "codeformer": "CodeFormerv0.1.onnx",
-    }
-    fname = fname_map[enhancer_choice]
-    mpath = download_from_list(fname, AUX_MODEL_URLS[fname], min_bytes=50_000_000)
-    if mpath is None:
-        return None
-    obj = OnnxFaceEnhancer(mpath, enhancer_choice)
-    _CACHE["enhancer_name"] = enhancer_choice
-    _CACHE["enhancer_obj"] = obj
-    return obj
-
-
-def inspect_source_gallery(source_file: Optional[str]) -> Tuple[List[str], str]:
-    """Mengekstrak dan menampilkan seluruh isi wajah di dalam .fsz atau foto tunggal untuk verifikasi."""
-    if not source_file:
-        return [], "Belum ada sumber wajah dipilih."
-
-    src_path = Path(source_file)
-    if not src_path.exists():
-        return [], "File sumber tidak ditemukan."
-
-    FACESET_WORK_DIR.mkdir(parents=True, exist_ok=True)
-    inspect_dir = FACESET_WORK_DIR / "active_preview"
-    if inspect_dir.exists():
-        shutil.rmtree(inspect_dir)
-    inspect_dir.mkdir(parents=True, exist_ok=True)
-
-    img_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-    saved_paths: List[str] = []
-
-    if src_path.suffix.lower() in {".fsz", ".zip"}:
-        with zipfile.ZipFile(src_path, "r") as zf:
-            idx = 0
-            for member in sorted(zf.infolist(), key=lambda m: m.filename):
-                if member.is_dir():
-                    continue
-                ext = Path(member.filename).suffix.lower()
-                if ext in img_exts:
-                    idx += 1
-                    out_f = inspect_dir / f"face_{idx:03d}{ext}"
-                    with zf.open(member) as s, open(out_f, "wb") as d:
-                        shutil.copyfileobj(s, d)
-                    saved_paths.append(str(out_f))
-        return saved_paths, f"Faceset terverifikasi: {len(saved_paths)} gambar wajah siap digabungkan."
-
-    out_f = inspect_dir / src_path.name
-    shutil.copy2(src_path, out_f)
-    return [str(out_f)], f"1 foto sumber aktif: {src_path.name}"
-
-
-def load_source_face(source_file: str, app, top_sharp_only: bool = False):
-    src_path = Path(source_file)
-    cache_key = f"{src_path.resolve()}_{src_path.stat().st_mtime}_{top_sharp_only}"
-    if _CACHE["source_key"] == cache_key and _CACHE["source_face"] is not None:
-        return _CACHE["source_face"]
-
-    img_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-    detected_faces = []
-
-    if src_path.suffix.lower() in {".fsz", ".zip"}:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with zipfile.ZipFile(src_path, "r") as zf:
-                zf.extractall(tmpdir)
-            all_imgs = [
-                Path(root) / fname
-                for root, _, files in os.walk(tmpdir)
-                for fname in sorted(files)
-                if (Path(root) / fname).suffix.lower() in img_exts
-            ]
-            if len(all_imgs) > 30:
-                step = len(all_imgs) / 30.0
-                all_imgs = [all_imgs[int(i * step)] for i in range(30)]
-
-            for fpath in all_imgs:
-                img = cv2.imread(str(fpath))
-                if img is None:
-                    continue
-                faces = detect_faces_angle_aware(app, img, enable_rotation=True)
-                if faces:
-                    best = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-                    detected_faces.append(best)
-
-        gc.collect()
-        if not detected_faces:
-            raise RuntimeError("Tidak ada wajah yang terdeteksi di dalam faceset (.fsz).")
-
-        if top_sharp_only and len(detected_faces) > 6:
-            detected_faces = sorted(
-                detected_faces,
-                key=lambda f: float(getattr(f, "det_score", 0.0)),
-                reverse=True,
-            )[:6]
-
-        raw_embs = [f.normed_embedding for f in detected_faces if getattr(f, "normed_embedding", None) is not None]
-        mean_emb = np.mean(np.stack(raw_embs, axis=0), axis=0)
-        norm = float(np.linalg.norm(mean_emb))
-        normed = (mean_emb / norm) if norm > 0 else mean_emb
-        merged_face = SimpleNamespace(
-            embedding=mean_emb.astype(np.float32),
-            normed_embedding=normed.astype(np.float32),
-        )
-        _CACHE["source_key"] = cache_key
-        _CACHE["source_face"] = merged_face
-        _CACHE["source_count"] = len(raw_embs)
-        print(f"[FACESET AKTIF] Menggabungkan {len(raw_embs)} embedding wajah dari {src_path.name}", flush=True)
-        return merged_face
-
-    src_img = cv2.imread(str(src_path))
-    if src_img is None:
-        raise FileNotFoundError(f"Gagal membaca file sumber: {src_path}")
-    faces = detect_faces_angle_aware(app, src_img, enable_rotation=True)
-    if not faces:
-        raise RuntimeError("Wajah tidak terdeteksi pada gambar sumber.")
-    best_face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-    _CACHE["source_key"] = cache_key
-    _CACHE["source_face"] = best_face
-    _CACHE["source_count"] = 1
-    return best_face
-
-
-# ================= TOOLS PEMBUAT FACESET (.FSZ) =================
-
-
-def _crop_padded_face(img_bgr: np.ndarray, face, out_size: int = 256) -> np.ndarray:
-    """Memotong area wajah dengan margin proporsional 35% agar dahi, dagu, dan telinga tetap terjaga."""
-    h, w = img_bgr.shape[:2]
-    x1, y1, x2, y2 = [float(v) for v in face.bbox[:4]]
-    bw, bh = x2 - x1, y2 - y1
-    cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
-    side = max(bw, bh) * 1.45
-
-    nx1 = max(0, int(cx - side * 0.5))
-    ny1 = max(0, int(cy - side * 0.5))
-    nx2 = min(w, int(cx + side * 0.5))
-    ny2 = min(h, int(cy + side * 0.5))
-
-    crop = img_bgr[ny1:ny2, nx1:nx2]
-    if crop.size == 0:
-        return cv2.resize(img_bgr, (out_size, out_size))
-    return cv2.resize(crop, (out_size, out_size), interpolation=cv2.INTER_AREA)
-
-
-def fsz_add_images(
-    uploaded_files: Optional[List[str]],
-    current_gallery: Optional[List[str]],
-    det_size: int,
-) -> Tuple[List[str], str]:
-    if not uploaded_files:
-        return current_gallery or [], "Pilih satu atau beberapa foto terlebih dahulu."
-
-    app = get_face_analyser(det_size=int(det_size))
-    builder_dir = FACESET_WORK_DIR / "builder_items"
-    builder_dir.mkdir(parents=True, exist_ok=True)
-
-    items = list(current_gallery) if current_gallery else []
-    added = 0
-    for fpath in uploaded_files:
-        p = Path(fpath)
-        if p.suffix.lower() in {".fsz", ".zip"}:
-            with zipfile.ZipFile(p, "r") as zf:
-                for member in sorted(zf.infolist(), key=lambda m: m.filename):
-                    if member.is_dir():
-                        continue
-                    ext = Path(member.filename).suffix.lower()
-                    if ext in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
-                        added += 1
-                        out_f = builder_dir / f"crop_{len(items) + 1:03d}{ext}"
-                        with zf.open(member) as s, open(out_f, "wb") as d:
-                            shutil.copyfileobj(s, d)
-                        items.append(str(out_f))
-            continue
-
-        img = cv2.imread(str(p))
-        if img is None:
-            continue
-        faces = detect_faces_angle_aware(app, img, enable_rotation=True)
-        if not faces:
-            continue
-        best = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-        crop = _crop_padded_face(img, best, out_size=256)
-        added += 1
-        out_f = builder_dir / f"crop_{len(items) + 1:03d}.png"
-        cv2.imwrite(str(out_f), crop)
-        items.append(str(out_f))
-
-    return items, f"Berhasil menambahkan {added} potongan wajah. Total dalam daftar: {len(items)} wajah."
-
-
-def fsz_cut_from_video(
-    video_file: Optional[str],
-    frame_num: int,
-    current_gallery: Optional[List[str]],
-    det_size: int,
-) -> Tuple[List[str], str]:
-    if not video_file:
-        return current_gallery or [], "Unggah video terlebih dahulu untuk memotong wajah dari frame."
-
-    cap = cv2.VideoCapture(str(video_file))
+def get_video_info(video_path: str) -> Tuple[int, float, int, int]:
+    cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return current_gallery or [], "Gagal membuka video."
-    total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
-    safe_idx = max(0, min(total - 1, int(frame_num)))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, safe_idx)
-    ret, frame = cap.read()
+        return 0, 30.0, 1920, 1080
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    if fps <= 1.0 or fps > 120.0:
+        fps = 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
     cap.release()
-    if not ret or frame is None:
-        return current_gallery or [], f"Gagal membaca frame ke-{safe_idx}."
-
-    app = get_face_analyser(det_size=int(det_size))
-    faces = detect_faces_angle_aware(app, frame, enable_rotation=True)
-    if not faces:
-        return current_gallery or [], f"Tidak ada wajah terdeteksi pada frame {safe_idx + 1}."
-
-    builder_dir = FACESET_WORK_DIR / "builder_items"
-    builder_dir.mkdir(parents=True, exist_ok=True)
-    items = list(current_gallery) if current_gallery else []
-
-    for face in faces:
-        crop = _crop_padded_face(frame, face, out_size=256)
-        out_f = builder_dir / f"vid_f{safe_idx + 1}_{len(items) + 1:03d}.png"
-        cv2.imwrite(str(out_f), crop)
-        items.append(str(out_f))
-
-    return items, f"Berhasil mengambil {len(faces)} wajah dari frame {safe_idx + 1}. Total: {len(items)} wajah."
+    return total_frames, fps, width, height
 
 
-def fsz_remove_selected(current_gallery: Optional[List[str]], selected_idx: Optional[int]) -> Tuple[List[str], str]:
-    items = list(current_gallery) if current_gallery else []
-    if not items:
-        return [], "Daftar faceset sudah kosong."
-    if selected_idx is None or selected_idx < 0 or selected_idx >= len(items):
-        # Jika tidak ada indeks dipilih, hapus item terakhir
-        items.pop()
-    else:
-        items.pop(selected_idx)
-    return items, f"1 wajah dihapus. Sisa dalam daftar: {len(items)} wajah."
+def compute_job_id(target_video: str, source_file: str) -> str:
+    v_path = Path(target_video)
+    s_path = Path(source_file) if source_file else None
+    v_size = v_path.stat().st_size if v_path.exists() else 0
+    s_size = s_path.stat().st_size if (s_path and s_path.exists()) else 0
+    raw = f"{v_path.name}|{v_size}|{s_path.name if s_path else ''}|{s_size}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
 
 
-def fsz_clear_all() -> Tuple[List[str], str]:
-    builder_dir = FACESET_WORK_DIR / "builder_items"
-    if builder_dir.exists():
-        shutil.rmtree(builder_dir)
-    return [], "Semua wajah di daftar faceset telah dibersihkan."
+class AutoResumeSegmentManager:
+    """
+    Menyimpan segmen sementara & state progres di Google Drive saat render berjalan,
+    melanjutkan otomatis setelah reconnect tanpa ketik manual, dan menghapus
+    seluruh file segmen sementara setelah hasil akhir berhasil dibuat.
+    """
+
+    def __init__(self, drive_root: str = "/content/drive/MyDrive/faceswap_workspace"):
+        self.drive_root = Path(drive_root)
+        self.final_dir = self.drive_root / "final_output"
+        self.temp_root = self.drive_root / "temp_segments"
+        self.final_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_root.mkdir(parents=True, exist_ok=True)
+
+    def get_job_dir(self, job_id: str) -> Path:
+        job_dir = self.temp_root / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        return job_dir
+
+    def get_state_file(self, job_id: str) -> Path:
+        return self.get_job_dir(job_id) / "render_state.json"
+
+    def load_state(self, job_id: str) -> Optional[Dict[str, Any]]:
+        state_path = self.get_state_file(job_id)
+        if not state_path.exists():
+            return None
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def find_latest_incomplete_state(self) -> Optional[Dict[str, Any]]:
+        if not self.temp_root.exists():
+            return None
+        candidates: List[Dict[str, Any]] = []
+        for sub in self.temp_root.iterdir():
+            if sub.is_dir():
+                st_file = sub / "render_state.json"
+                if st_file.exists():
+                    try:
+                        with open(st_file, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        if not data.get("completed", False):
+                            data["_job_dir"] = str(sub)
+                            data["_updated_at"] = st_file.stat().st_mtime
+                            candidates.append(data)
+                    except Exception:
+                        pass
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x.get("_updated_at", 0), reverse=True)
+        return candidates[0]
+
+    def save_state(self, job_id: str, state: Dict[str, Any]):
+        state_path = self.get_state_file(job_id)
+        tmp_path = state_path.with_suffix(".json.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, state_path)
+
+    def cleanup_temp_job(self, job_id: str):
+        job_dir = self.temp_root / job_id
+        if job_dir.exists():
+            shutil.rmtree(job_dir, ignore_errors=True)
+        free_memory(deep_cuda=True)
+
+    def merge_segments_to_final(
+        self,
+        job_id: str,
+        target_video: str,
+        fps: float,
+        final_filename: str = "hasil_swap.mp4",
+    ) -> Tuple[bool, str]:
+        job_dir = self.get_job_dir(job_id)
+        seg_files = sorted(job_dir.glob("part_*.mp4"))
+        valid_segs = [p for p in seg_files if p.exists() and p.stat().st_size > 0]
+        if not valid_segs:
+            return False, "Tidak ada file potongan segmen yang valid untuk digabungkan."
+
+        concat_list = job_dir / "concat_list.txt"
+        with open(concat_list, "w", encoding="utf-8") as f:
+            for p in valid_segs:
+                f.write(f"file '{p.resolve().as_posix()}'\n")
+
+        merged_video_only = job_dir / "_merged_no_audio.mp4"
+        cmd_concat = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_list),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "18",
+            "-preset",
+            "fast",
+            str(merged_video_only),
+        ]
+        res_concat = subprocess.run(cmd_concat, capture_output=True, text=True)
+        if res_concat.returncode != 0 or not merged_video_only.exists():
+            return False, f"Gagal menggabungkan segmen: {res_concat.stderr[-300:]}"
+
+        final_path = self.final_dir / final_filename
+        cmd_mux = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(merged_video_only),
+            "-i",
+            target_video,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a?",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(final_path),
+        ]
+        res_mux = subprocess.run(cmd_mux, capture_output=True, text=True)
+        if res_mux.returncode != 0 or not final_path.exists() or final_path.stat().st_size == 0:
+            # Fallback jika video target tidak punya track audio
+            shutil.copy2(merged_video_only, final_path)
+
+        if final_path.exists() and final_path.stat().st_size > 0:
+            # Otomatis hapus seluruh file potongan sementara setelah hasil akhir jadi
+            self.cleanup_temp_job(job_id)
+            return True, str(final_path)
+
+        return False, "File hasil akhir kosong atau gagal dibuat."
 
 
-def fsz_build_and_apply(
-    current_gallery: Optional[List[str]],
-    faceset_name: str,
-) -> Tuple[Optional[str], Optional[str], List[str], str]:
-    items = list(current_gallery) if current_gallery else []
-    if not items:
-        return None, None, [], "Daftar wajah kosong. Tambahkan minimal 1 foto/frame terlebih dahulu."
+class FastFaceSwapEngine:
+    def __init__(self, models_dir: str = "/content/fast_fs/models"):
+        self.models_dir = Path(models_dir)
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        self.face_app: Optional[FaceAnalysis] = None
+        self.current_det_size: int = 640
+        self.swapper = None
 
-    clean_name = "".join(c for c in (faceset_name or "custom_faceset") if c.isalnum() or c in ("_", "-")).strip()
-    if not clean_name:
-        clean_name = "custom_faceset"
-
-    out_dir = Path("output")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fsz_path = out_dir / f"{clean_name}.fsz"
-
-    with zipfile.ZipFile(fsz_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for i, item_path in enumerate(items, start=1):
-            p = Path(item_path)
-            if p.exists():
-                zf.write(p, arcname=f"face_{i:03d}{p.suffix.lower()}")
-
-    preview_list, verify_msg = inspect_source_gallery(str(fsz_path))
-    return (
-        str(fsz_path),
-        str(fsz_path),
-        preview_list,
-        f"Faceset '{fsz_path.name}' selesai dibuat ({len(items)} wajah) & langsung dipasang sebagai Sumber Wajah!",
-    )
-
-
-# ================= PROSES FACE SWAP =================
-
-
-def process_face_advanced(
-    frame: np.ndarray,
-    face,
-    src_face,
-    swapper: UniversalOnnxSwapper,
-    enhancer_obj: Optional[OnnxFaceEnhancer],
-    xseg_obj: Optional[XSegMasker],
-    parser_obj: Optional[BiSeNetFaceParser],
-    swap_weight: float = 1.0,
-    enhancer_blend: float = 0.30,
-    eye_expr_strength: float = 0.35,
-    use_color_match: bool = True,
-    use_xseg: bool = True,
-    use_face_parser: bool = True,
-    protect_mouth: bool = True,
-    mask_blur: int = 13,
-) -> np.ndarray:
-    h, w = frame.shape[:2]
-    crop_size = swapper.crop_size
-
-    aligned_tgt, M = align_face_crop(frame, face.kps, crop_size=crop_size)
-    swapped_crop = swapper.swap_crop(aligned_tgt, src_face)
-
-    base_mask = np.zeros((crop_size, crop_size), dtype=np.float32)
-    cv2.ellipse(
-        base_mask,
-        center=(crop_size // 2, int(crop_size * 0.55)),
-        axes=(int(crop_size * 0.44), int(crop_size * 0.50)),
-        angle=0,
-        startAngle=0,
-        endAngle=360,
-        color=1.0,
-        thickness=-1,
-    )
-    top_pad = int(crop_size * 0.05)
-    bot_pad = int(crop_size * 0.03)
-    base_mask[:top_pad, :] = 0.0
-    base_mask[crop_size - bot_pad :, :] = 0.0
-
-    combined_mask = base_mask.copy()
-
-    if use_face_parser and parser_obj is not None:
-        region_mask = parser_obj.predict_face_region_mask(aligned_tgt)
-        combined_mask = combined_mask * region_mask
-
-    if use_xseg and xseg_obj is not None:
-        occ_mask = xseg_obj.predict_mask(aligned_tgt)
-        if protect_mouth:
-            mouth_zone = np.zeros((crop_size, crop_size), dtype=np.float32)
-            cv2.ellipse(
-                mouth_zone,
-                center=(crop_size // 2, int(crop_size * 0.78)),
-                axes=(int(crop_size * 0.24), int(crop_size * 0.14)),
-                angle=0,
-                startAngle=0,
-                endAngle=360,
-                color=1.0,
-                thickness=-1,
+    def get_face_analyser(self, det_size: int = 640) -> FaceAnalysis:
+        if self.face_app is None or self.current_det_size != det_size:
+            self.face_app = None
+            free_memory(deep_cuda=True)
+            app = FaceAnalysis(
+                name="buffalo_l",
+                root=str(self.models_dir),
+                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
             )
-            occ_mask = np.maximum(occ_mask, mouth_zone)
-        combined_mask = combined_mask * occ_mask
+            app.prepare(ctx_id=0, det_size=(det_size, det_size))
+            self.face_app = app
+            self.current_det_size = det_size
+        return self.face_app
 
-    if use_color_match:
-        swapped_crop = match_color_lab(swapped_crop, aligned_tgt, combined_mask)
+    def get_swapper(self):
+        if self.swapper is None:
+            model_path = self.models_dir / "inswapper_128.onnx"
+            if not model_path.exists():
+                raise FileNotFoundError(
+                    f"Model {model_path} belum ada. Pastikan inswapper_128.onnx tersedia."
+                )
+            self.swapper = insightface.model_zoo.get_model(
+                str(model_path),
+                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            )
+        return self.swapper
 
-    if eye_expr_strength > 0.0:
-        swapped_crop = restore_eye_expression(swapped_crop, aligned_tgt, strength=float(eye_expr_strength))
+    def swap_frame(
+        self,
+        frame_bgr: np.ndarray,
+        source_img_bgr: np.ndarray,
+        det_size: int = 640,
+        blend_strength: float = 0.85,
+    ) -> np.ndarray:
+        analyser = self.get_face_analyser(det_size=det_size)
+        swapper = self.get_swapper()
 
-    if enhancer_obj is not None and enhancer_blend > 0.0:
-        enhanced = enhancer_obj.enhance_crop(swapped_crop)
-        eb = float(np.clip(enhancer_blend, 0.0, 1.0))
-        swapped_crop = np.clip(
-            enhanced.astype(np.float32) * eb + swapped_crop.astype(np.float32) * (1.0 - eb),
-            0,
-            255,
-        ).astype(np.uint8)
+        src_faces = analyser.get(source_img_bgr)
+        if not src_faces:
+            return frame_bgr
+        src_face = sorted(
+            src_faces,
+            key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]),
+            reverse=True,
+        )[0]
 
-    k = max(5, int(mask_blur) | 1)
-    soft_mask = cv2.GaussianBlur(combined_mask, (k, k), 0) * float(np.clip(swap_weight, 0.0, 1.0))
+        tgt_faces = analyser.get(frame_bgr)
+        if not tgt_faces:
+            return frame_bgr
 
-    inv_M = cv2.invertAffineTransform(M)
-    warped_face = cv2.warpAffine(swapped_crop, inv_M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT_101)
-    warped_mask = cv2.warpAffine(soft_mask, inv_M, (w, h), flags=cv2.INTER_LINEAR, borderValue=0.0)[..., None]
-
-    out = warped_face.astype(np.float32) * warped_mask + frame.astype(np.float32) * (1.0 - warped_mask)
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def select_target_faces(faces, mode: str = "largest"):
-    if not faces:
-        return []
-    if mode == "all":
-        return faces
-    largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-    return [largest]
-
-
-def get_video_frame_count(target_file: Optional[str]) -> int:
-    if not target_file:
-        return 1
-    p = Path(target_file)
-    if p.suffix.lower() not in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
-        return 1
-    cap = cv2.VideoCapture(str(p))
-    if not cap.isOpened():
-        return 1
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
-    return max(1, total)
+        out_frame = frame_bgr.copy()
+        for tgt_face in tgt_faces:
+            swapped = swapper.get(out_frame, tgt_face, src_face, paste_back=True)
+            if blend_strength < 0.999:
+                out_frame = cv2.addWeighted(
+                    swapped, blend_strength, out_frame, 1.0 - blend_strength, 0
+                )
+            else:
+                out_frame = swapped
+        return out_frame
 
 
-def preview_single_frame(
-    source_file: Optional[str],
-    target_file: Optional[str],
-    frame_index: int,
-    swapper_model: str,
-    swap_weight: float,
-    enhancer: str,
-    enhancer_blend: float,
-    eye_expr_strength: float,
-    use_angle_rot: bool,
-    use_face_parser: bool,
-    use_xseg: bool,
-    protect_mouth: bool,
-    use_color_match: bool,
-    use_temporal_smooth: bool,
-    top_sharp_fsz: bool,
-    face_mode: str,
-    det_size: int,
-    mask_blur: int,
-) -> Tuple[Optional[np.ndarray], str]:
-    try:
-        if not source_file or not target_file:
-            return None, "Unggah / buat Sumber Wajah (.jpg/.png/.fsz) dan Target, lalu klik Cek Preview."
+def create_faceset_zip(images: List[Any], faceset_name: str, out_dir: str = "/content/fast_fs/output") -> Tuple[Optional[str], str]:
+    if not images:
+        return None, "Belum ada foto wajah yang ditambahkan ke daftar faceset."
 
-        app = get_face_analyser(det_size=int(det_size))
-        swapper = get_swapper(swapper_model)
-        enhancer_obj = get_enhancer(enhancer)
-        xseg_obj = get_xseg() if use_xseg else None
-        parser_obj = get_face_parser() if use_face_parser else None
-        src_face = load_source_face(source_file, app, top_sharp_only=bool(top_sharp_fsz))
-        src_cnt = int(_CACHE.get("source_count", 1))
+    clean_name = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in (faceset_name or "faceset_multi_sudut")).strip("_")
+    if not clean_name:
+        clean_name = "faceset_multi_sudut"
 
-        target_path = Path(target_file)
-        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
-        if target_path.suffix.lower() in video_exts:
-            cap = cv2.VideoCapture(str(target_path))
-            if not cap.isOpened():
-                return None, "Gagal membuka file video target."
-            total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
-            safe_idx = max(0, min(total - 1, int(frame_index)))
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    stage_dir = out_path / f"_tmp_{clean_name}"
+    if stage_dir.exists():
+        shutil.rmtree(stage_dir, ignore_errors=True)
+    stage_dir.mkdir(parents=True, exist_ok=True)
 
-            tracker = TemporalFaceTracker() if use_temporal_smooth else None
-            start_idx = max(0, safe_idx - 2) if use_temporal_smooth else safe_idx
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+    saved_count = 0
+    for idx, item in enumerate(images):
+        img_path = None
+        if isinstance(item, tuple) and len(item) > 0:
+            img_path = item[0]
+        elif isinstance(item, str):
+            img_path = item
+        elif isinstance(item, dict) and "name" in item:
+            img_path = item["name"]
 
-            frame = None
-            faces = []
-            for _ in range(start_idx, safe_idx + 1):
-                ret, f_img = cap.read()
-                if not ret or f_img is None:
+        if img_path and Path(img_path).exists():
+            ext = Path(img_path).suffix or ".jpg"
+            shutil.copy2(img_path, stage_dir / f"angle_{idx+1:02d}{ext}")
+            saved_count += 1
+
+    if saved_count == 0:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        return None, "Gagal membaca file gambar wajah."
+
+    fsz_path = out_path / f"{clean_name}.fsz"
+    if fsz_path.exists():
+        fsz_path.unlink()
+
+    archive_base = str(out_path / clean_name)
+    zip_created = shutil.make_archive(archive_base, "zip", root_dir=str(stage_dir))
+    shutil.rmtree(stage_dir, ignore_errors=True)
+
+    os.replace(zip_created, str(fsz_path))
+    return str(fsz_path), f"Faceset '{fsz_path.name}' ({saved_count} sudut) berhasil dibuat di {fsz_path}."
+
+
+def build_ui(
+    drive_workspace: str = "/content/drive/MyDrive/faceswap_workspace",
+    models_dir: str = "/content/fast_fs/models",
+):
+    seg_mgr = AutoResumeSegmentManager(drive_root=drive_workspace)
+    engine = FastFaceSwapEngine(models_dir=models_dir)
+
+    saved_state = seg_mgr.find_latest_incomplete_state()
+    init_settings = saved_state.get("settings", {}) if saved_state else {}
+
+    def get_init_status_text() -> str:
+        if saved_state:
+            last_f = int(saved_state.get("last_completed_frame", -1))
+            total_f = int(saved_state.get("total_frames", 0))
+            next_f = last_f + 1
+            return (
+                f"Terdeteksi progres tersimpan di Google Drive: selesai sampai frame {last_f + 1}/{total_f}. "
+                f"Klik 'Render / Lanjutkan Otomatis' untuk menyambung dari frame {next_f + 1} tanpa setting ulang."
+            )
+        return "Siap. Segmen sementara disimpan di Google Drive dan otomatis dihapus setelah hasil akhir jadi."
+
+    def run_auto_render(
+        target_video: str,
+        source_file: str,
+        segment_size: int,
+        det_size: int,
+        blend_strength: float,
+        final_name: str,
+        force_restart: bool,
+        progress=gr.Progress(track_tqdm=False),
+    ):
+        if not target_video or not Path(target_video).exists():
+            yield None, "Pilih file video target terlebih dahulu."
+            return
+        if not source_file or not Path(source_file).exists():
+            yield None, "Pilih foto sumber wajah terlebih dahulu."
+            return
+
+        src_img = cv2.imread(source_file)
+        if src_img is None:
+            yield None, "Gagal membaca gambar sumber wajah."
+            return
+
+        total_frames, fps, width, height = get_video_info(target_video)
+        if total_frames <= 0:
+            yield None, "Tidak dapat membaca jumlah frame video target."
+            return
+
+        job_id = compute_job_id(target_video, source_file)
+        job_dir = seg_mgr.get_job_dir(job_id)
+
+        current_settings = {
+            "target_video": target_video,
+            "source_file": source_file,
+            "segment_size": int(segment_size),
+            "det_size": int(det_size),
+            "blend_strength": float(blend_strength),
+            "final_name": final_name or "hasil_swap.mp4",
+        }
+
+        if force_restart:
+            seg_mgr.cleanup_temp_job(job_id)
+            job_dir = seg_mgr.get_job_dir(job_id)
+            state = None
+        else:
+            state = seg_mgr.load_state(job_id)
+
+        if state and not state.get("completed", False):
+            start_frame = int(state.get("last_completed_frame", -1)) + 1
+            seg_index = int(state.get("next_seg_index", 0))
+        else:
+            start_frame = 0
+            seg_index = 0
+
+        if start_frame < 0 or start_frame >= total_frames:
+            start_frame = 0
+            seg_index = 0
+
+        seg_size = max(50, int(segment_size))
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+        while start_frame < total_frames:
+            end_frame = min(total_frames, start_frame + seg_size)
+            seg_path = job_dir / f"part_{seg_index:04d}.mp4"
+            if seg_path.exists():
+                seg_path.unlink()
+
+            writer = cv2.VideoWriter(str(seg_path), fourcc, fps, (width, height))
+            cap = cv2.VideoCapture(target_video)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+            processed_in_seg = 0
+            for f_idx in range(start_frame, end_frame):
+                ret, frame = cap.read()
+                if not ret or frame is None:
                     break
-                frame = f_img
-                raw_f = detect_faces_angle_aware(app, frame, enable_rotation=bool(use_angle_rot))
-                if tracker is not None:
-                    faces = tracker.update(raw_f)
-                else:
-                    faces = select_target_faces(raw_f, mode=face_mode)
+
+                out_frame = engine.swap_frame(
+                    frame_bgr=frame,
+                    source_img_bgr=src_img,
+                    det_size=int(det_size),
+                    blend_strength=float(blend_strength),
+                )
+                writer.write(out_frame)
+                processed_in_seg += 1
+
+                if processed_in_seg % 15 == 0 or f_idx == end_frame - 1:
+                    seg_mgr.save_state(
+                        job_id,
+                        {
+                            "job_id": job_id,
+                            "last_completed_frame": f_idx,
+                            "total_frames": total_frames,
+                            "next_seg_index": seg_index + (1 if f_idx == end_frame - 1 else 0),
+                            "completed": False,
+                            "settings": current_settings,
+                        },
+                    )
+                    free_memory(deep_cuda=(processed_in_seg % 45 == 0))
+                    pct = (f_idx + 1) / max(1, total_frames)
+                    progress(
+                        pct,
+                        desc=f"Segmen {seg_index + 1} | Frame {f_idx + 1}/{total_frames}",
+                    )
+                    yield None, (
+                        f"Memproses frame {f_idx + 1}/{total_frames} "
+                        f"(Segmen #{seg_index + 1} tersimpan sementara di Drive)."
+                    )
 
             cap.release()
-            if frame is None:
-                return None, f"Gagal membaca frame ke-{safe_idx}."
-            status = f"Frame {safe_idx + 1}/{total} | {src_cnt} wajah sumber digabung | Model: {swapper.model_name}"
-        else:
-            frame = cv2.imread(str(target_path))
-            if frame is None:
-                return None, "Gagal membaca gambar target."
-            raw_f = detect_faces_angle_aware(app, frame, enable_rotation=bool(use_angle_rot))
-            faces = select_target_faces(raw_f, mode=face_mode)
-            status = f"Preview Gambar | {src_cnt} wajah sumber digabung | Model: {swapper.model_name}"
+            writer.release()
+            free_memory(deep_cuda=True)
 
-        out_frame = frame.copy()
-        if not faces:
-            status += " (Wajah tidak terdeteksi pada frame ini)"
-        for face in faces:
-            out_frame = process_face_advanced(
-                out_frame,
-                face,
-                src_face,
-                swapper=swapper,
-                enhancer_obj=enhancer_obj,
-                xseg_obj=xseg_obj,
-                parser_obj=parser_obj,
-                swap_weight=float(swap_weight),
-                enhancer_blend=float(enhancer_blend),
-                eye_expr_strength=float(eye_expr_strength),
-                use_color_match=bool(use_color_match),
-                use_xseg=bool(use_xseg),
-                use_face_parser=bool(use_face_parser),
-                protect_mouth=bool(protect_mouth),
-                mask_blur=int(mask_blur),
+            start_frame = end_frame
+            seg_index += 1
+
+        clean_final_name = (final_name or "hasil_swap.mp4").strip()
+        if not clean_final_name.lower().endswith(".mp4"):
+            clean_final_name += ".mp4"
+
+        ok, final_or_err = seg_mgr.merge_segments_to_final(
+            job_id=job_id,
+            target_video=target_video,
+            fps=fps,
+            final_filename=clean_final_name,
+        )
+        if ok:
+            yield final_or_err, (
+                f"Selesai! Hasil akhir tersimpan di: {final_or_err}. "
+                f"Seluruh file potongan sementara sudah otomatis dihapus."
             )
-
-        return cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB), status
-    except Exception as exc:
-        return None, f"Error Preview: {exc}"
-
-
-def run_render_full(
-    source_file: str,
-    target_file: str,
-    swapper_model: str,
-    swap_weight: float,
-    enhancer: str,
-    enhancer_blend: float,
-    eye_expr_strength: float,
-    use_angle_rot: bool,
-    use_face_parser: bool,
-    use_xseg: bool,
-    protect_mouth: bool,
-    use_color_match: bool,
-    use_temporal_smooth: bool,
-    top_sharp_fsz: bool,
-    face_mode: str,
-    det_size: int,
-    mask_blur: int,
-    progress=None,
-) -> Tuple[str, str]:
-    if not source_file or not target_file:
-        raise ValueError("Sumber wajah dan target wajib diisi.")
-
-    app = get_face_analyser(det_size=int(det_size))
-    swapper = get_swapper(swapper_model)
-    enhancer_obj = get_enhancer(enhancer)
-    xseg_obj = get_xseg() if use_xseg else None
-    parser_obj = get_face_parser() if use_face_parser else None
-    src_face = load_source_face(source_file, app, top_sharp_only=bool(top_sharp_fsz))
-    src_cnt = int(_CACHE.get("source_count", 1))
-
-    target_path = Path(target_file)
-    out_dir = Path("output")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
-    if target_path.suffix.lower() in video_exts:
-        out_path = out_dir / "hasil_swap.mp4"
-        temp_video = out_dir / "hasil_swap.raw.mp4"
-
-        cap = cv2.VideoCapture(str(target_path))
-        if not cap.isOpened():
-            raise FileNotFoundError(f"Gagal membuka video target: {target_path}")
-
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
-
-        writer = cv2.VideoWriter(str(temp_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-        tracker = TemporalFaceTracker() if use_temporal_smooth else None
-
-        idx = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            idx += 1
-            out_frame = frame.copy()
-            raw_faces = detect_faces_angle_aware(app, frame, enable_rotation=bool(use_angle_rot))
-            if tracker is not None:
-                faces = tracker.update(raw_faces)
-            else:
-                faces = select_target_faces(raw_faces, mode=face_mode)
-
-            for face in faces:
-                out_frame = process_face_advanced(
-                    out_frame,
-                    face,
-                    src_face,
-                    swapper=swapper,
-                    enhancer_obj=enhancer_obj,
-                    xseg_obj=xseg_obj,
-                    parser_obj=parser_obj,
-                    swap_weight=float(swap_weight),
-                    enhancer_blend=float(enhancer_blend),
-                    eye_expr_strength=float(eye_expr_strength),
-                    use_color_match=bool(use_color_match),
-                    use_xseg=bool(use_xseg),
-                    use_face_parser=bool(use_face_parser),
-                    protect_mouth=bool(protect_mouth),
-                    mask_blur=int(mask_blur),
-                )
-            writer.write(out_frame)
-
-            if idx % 20 == 0 or idx == total:
-                gc.collect()
-                if progress is not None:
-                    progress((idx, total), desc=f"Merender frame {idx}/{total}")
-                print(f"[CUDA RENDER] Frame {idx}/{total} ({src_cnt} wajah sumber)", flush=True)
-
-        cap.release()
-        writer.release()
-        gc.collect()
-
-        mux_cmd = (
-            f'ffmpeg -y -i "{temp_video}" -i "{target_path}" '
-            f'-c:v libx264 -preset fast -crf 18 -c:a aac -map 0:v:0 -map 1:a? -shortest "{out_path}"'
-        )
-        rc = run_cmd(mux_cmd)
-        if rc == 0 and out_path.exists():
-            temp_video.unlink(missing_ok=True)
         else:
-            shutil.move(str(temp_video), str(out_path))
-        return str(out_path), f"Selesai ({total} frame, {src_cnt} wajah digabung) -> {out_path}"
+            yield None, f"Proses selesai merender segmen, tetapi penggabungan gagal: {final_or_err}"
 
-    tgt_img = cv2.imread(str(target_path))
-    if tgt_img is None:
-        raise FileNotFoundError(f"Gagal membaca foto target: {target_path}")
-    out = tgt_img.copy()
-    raw_faces = detect_faces_angle_aware(app, tgt_img, enable_rotation=bool(use_angle_rot))
-    faces = select_target_faces(raw_faces, mode=face_mode)
-    for face in faces:
-        out = process_face_advanced(
-            out,
-            face,
-            src_face,
-            swapper=swapper,
-            enhancer_obj=enhancer_obj,
-            xseg_obj=xseg_obj,
-            parser_obj=parser_obj,
-            swap_weight=float(swap_weight),
-            enhancer_blend=float(enhancer_blend),
-            eye_expr_strength=float(eye_expr_strength),
-            use_color_match=bool(use_color_match),
-            use_xseg=bool(use_xseg),
-            use_face_parser=bool(use_face_parser),
-            protect_mouth=bool(protect_mouth),
-            mask_blur=int(mask_blur),
+    with gr.Blocks(title="Auto-Resume Segment FaceSwap") as demo:
+        gr.Markdown("## Render Video Otomatis Per Segmen (Auto-Resume & Auto-Cleanup)")
+        status_box = gr.Textbox(
+            label="Status Progres Otomatis",
+            value=get_init_status_text(),
+            interactive=False,
         )
-    img_out = out_dir / "hasil_swap.png"
-    cv2.imwrite(str(img_out), out)
-    return str(img_out), f"Selesai ({src_cnt} wajah digabung) -> {img_out}"
-
-
-def launch_fast_ui(share: bool = True) -> None:
-    import gradio as gr
-    import onnxruntime as ort
-
-    providers = ort.get_available_providers()
-    gpu_status = "CUDA GPU AKTIF" if "CUDAExecutionProvider" in providers else "CPU MODE (Aktifkan T4 GPU!)"
-
-    with gr.Blocks(title="Fast FaceSwap CUDA UI + Faceset Studio") as demo:
-        gr.Markdown(f"### Fast FaceSwap Pro UI & Faceset Studio — **{gpu_status}**")
 
         with gr.Row():
-            source_in = gr.File(
-                label="Sumber Wajah Aktif (.jpg / .png / .fsz)",
-                type="filepath",
+            target_video_in = gr.Textbox(
+                label="Path Video Target (1080p)",
+                value=init_settings.get("target_video", ""),
+                placeholder="/content/drive/MyDrive/video_target.mp4",
             )
-            target_in = gr.File(
-                label="Video atau Foto Target",
-                type="filepath",
+            source_file_in = gr.Textbox(
+                label="Path Foto / Faceset Sumber",
+                value=init_settings.get("source_file", ""),
+                placeholder="/content/drive/MyDrive/wajah.jpg",
             )
-
-        # Galeri verifikasi otomatis isi faceset aktif agar yakin semua foto terbaca
-        active_faces_gallery = gr.Gallery(
-            label="Verifikasi Isi Wajah Aktif (Semua foto di bawah ini digabung)",
-            columns=5,
-            height="auto",
-            object_fit="contain",
-        )
-        active_faces_info = gr.Textbox(label="Info Wajah Sumber", interactive=False)
-
-        # Menu lipat pembuat faceset.fsz langsung di halaman yang sama tanpa pindah tab
-        with gr.Accordion("Tools: Buat / Edit Faceset (.fsz) & Potong Wajah dari Video", open=False):
-            gr.Markdown("Gabungkan beberapa foto sudut wajah atau potong langsung dari frame video menjadi satu file `.fsz`.")
-            fsz_input_files = gr.File(
-                label="1. Input Files (Pilih banyak foto sekaligus atau file .fsz lama)",
-                file_count="multiple",
-                type="filepath",
-            )
-            fsz_add_btn = gr.Button("Tambahkan Foto ke Daftar Faceset", variant="secondary")
-
-            with gr.Row():
-                fsz_video_in = gr.File(label="2. Cut Face from Video Frame (Opsional)", type="filepath")
-                fsz_frame_num = gr.Number(value=0, precision=0, label="Nomor Frame Video")
-            fsz_cut_btn = gr.Button("Use Faces from This Frame (Potong Wajah dari Frame)", variant="secondary")
-
-            fsz_builder_gallery = gr.Gallery(
-                label="Faces in this Faceset (Klik gambar untuk memilih sebelum dihapus)",
-                columns=4,
-                height="auto",
-                object_fit="contain",
-            )
-            fsz_selected_idx = gr.State(value=None)
-            fsz_name_in = gr.Textbox(value="faceset_multi_sudut", label="Nama File Output (.fsz)")
-
-            with gr.Row():
-                fsz_remove_btn = gr.Button("Remove Selected", variant="secondary")
-                fsz_clear_btn = gr.Button("Clear All", variant="stop")
-            fsz_create_btn = gr.Button("Create / Update Faceset & Pakai Langsung", variant="primary")
-            fsz_status = gr.Textbox(label="Status Faceset Studio", interactive=False)
-            fsz_download_box = gr.File(label="Download File .fsz Hasil")
 
         with gr.Row():
-            swapper_in = gr.Dropdown(
-                choices=list(SWAPPER_URLS.keys()),
-                value="inswapper_128_fp16",
-                label="Face Swapper Model",
-                info="inswapper_128_fp16 paling konsisten untuk sudut miring & ekspresi.",
+            segment_size_in = gr.Slider(
+                label="Ukuran Segmen (Frame per Potongan Sementara)",
+                minimum=100,
+                maximum=600,
+                step=50,
+                value=int(init_settings.get("segment_size", 250)),
             )
-            swap_weight_in = gr.Slider(
+            det_size_in = gr.Dropdown(
+                label="Detection Size",
+                choices=[512, 640],
+                value=int(init_settings.get("det_size", 512)),
+            )
+            blend_in = gr.Slider(
+                label="Blend Strength",
                 minimum=0.1,
                 maximum=1.0,
                 step=0.05,
-                value=1.0,
-                label="Face Swapper Weight",
-                info="1.0 penuh agar hasil swap tidak transparan/tercampur.",
+                value=float(init_settings.get("blend_strength", 0.85)),
             )
 
         with gr.Row():
-            enhancer_in = gr.Dropdown(
-                choices=["restoreformer++", "gpen-512", "codeformer", "none"],
-                value="restoreformer++",
-                label="Face Enhancer",
-                info="Mempertajam detail kulit, bibir & mata setelah swap.",
+            final_name_in = gr.Textbox(
+                label="Nama File Hasil Akhir di Google Drive",
+                value=init_settings.get("final_name", "hasil_swap_final.mp4"),
             )
-            enhancer_blend_in = gr.Slider(
-                minimum=0.0,
-                maximum=1.0,
-                step=0.05,
-                value=0.30,
-                label="Enhancer Blend",
-                info="0.25–0.35 menjaga wajah & mata tetap natural.",
-            )
-            eye_expr_in = gr.Slider(
-                minimum=0.0,
-                maximum=0.8,
-                step=0.05,
-                value=0.35,
-                label="Eye Expression Restorer",
-                info="Mempertahankan arah bayangan kelopak & tatapan mata asli target.",
-            )
-
-        with gr.Row():
-            use_angle_rot_in = gr.Checkbox(
-                value=True,
-                label="Auto Rotasi Deteksi (90°/270°)",
-                info="Wajib aktif untuk kepala rebah/miring agar titik mata tidak miss.",
-            )
-            use_parser_in = gr.Checkbox(
-                value=True,
-                label="Face Parser (BiSeNet)",
-                info="Memisahkan poni rambut agar tidak tertimpa kulit wajah.",
-            )
-            use_xseg_in = gr.Checkbox(
-                value=True,
-                label="XSeg Occlusion Mask",
-                info="Menjaga tangan/rambut/kacamata di depan wajah tetap utuh.",
-            )
-
-        with gr.Row():
-            protect_mouth_in = gr.Checkbox(
-                value=True,
-                label="Kunci Area Mulut",
-                info="Mencegah bibir terpotong saat mulut terbuka/bicara.",
-            )
-            use_color_in = gr.Checkbox(
-                value=True,
-                label="Color Match (LAB)",
-                info="Menyamakan warna kulit dengan pencahayaan video.",
-            )
-            use_temporal_in = gr.Checkbox(
+            force_restart_cb = gr.Checkbox(
+                label="Mulai dari Frame 0 (Hapus Progres Lama)",
                 value=False,
-                label="Temporal Smoothing & Anti-Miss (Opsional)",
-                info="Default OFF. Centang untuk menghaluskan getaran & mencegah miss saat gerakan cepat.",
-            )
-            top_sharp_in = gr.Checkbox(
-                value=False,
-                label="Filter Top-6 Foto Tajam (.fsz)",
-                info="Default OFF. Centang jika .fsz berisi banyak sudut acak agar embedding lebih tajam.",
             )
 
-        with gr.Row():
-            face_mode_in = gr.Dropdown(
-                choices=["largest", "all"],
-                value="largest",
-                label="Target Wajah",
-                info="largest = wajah utama; all = semua wajah.",
+        run_btn = gr.Button("Render / Lanjutkan Otomatis", variant="primary")
+        video_out = gr.Video(label="Hasil Video Akhir")
+
+        run_btn.click(
+            fn=run_auto_render,
+            inputs=[
+                target_video_in,
+                source_file_in,
+                segment_size_in,
+                det_size_in,
+                blend_in,
+                final_name_in,
+                force_restart_cb,
+            ],
+            outputs=[video_out, status_box],
+        )
+
+        with gr.Accordion("Faceset Studio (.fsz)", open=False):
+            fsz_gallery = gr.Gallery(label="Potongan Sudut Wajah", type="filepath")
+            fsz_name = gr.Textbox(label="Nama Faceset", value="faceset_multi_sudut")
+            fsz_btn = gr.Button("Buat File .fsz")
+            fsz_out_file = gr.File(label="File .fsz Hasil")
+            fsz_msg = gr.Textbox(label="Status Faceset", interactive=False)
+
+            def on_make_fsz(imgs, fname):
+                fpath, msg = create_faceset_zip(imgs, fname)
+                return fpath, (fpath or ""), msg
+
+            fsz_btn.click(
+                fn=on_make_fsz,
+                inputs=[fsz_gallery, fsz_name],
+                outputs=[fsz_out_file, source_file_in, fsz_msg],
             )
-            det_size_in = gr.Slider(
-                minimum=320,
-                maximum=960,
-                step=64,
-                value=640,
-                label="Det Size (Presisi Landmark)",
-                info="640 mengunci koordinat sudut mata & bibir dengan presisi.",
-            )
-            mask_blur_in = gr.Slider(
-                minimum=5,
-                maximum=35,
-                step=2,
-                value=13,
-                label="Mask Blur (Kehalusan Tepi)",
-                info="11–15 menghaluskan batas pipi tanpa mengaburkan mata/mulut.",
-            )
 
-        gr.Markdown("---")
-        preview_img = gr.Image(label="Live Preview Hasil Per Frame", interactive=False)
-        frame_slider = gr.Slider(minimum=0, maximum=100, step=1, value=0, label="Geser Frame (Live Preview)")
-        with gr.Row():
-            preview_btn = gr.Button("Cek Preview Frame", variant="secondary")
-            run_btn = gr.Button("Render Video Lengkap", variant="primary")
-
-        preview_status = gr.Textbox(label="Status Render / Preview", interactive=False)
-        output_file_box = gr.File(label="Download Hasil")
-
-        # Event verifikasi otomatis setiap kali file sumber diunggah
-        source_in.change(
-            fn=inspect_source_gallery,
-            inputs=[source_in],
-            outputs=[active_faces_gallery, active_faces_info],
-        )
-
-        # Event Faceset Studio
-        def on_gallery_select(evt: gr.SelectData):
-            return evt.index
-
-        fsz_builder_gallery.select(fn=on_gallery_select, outputs=[fsz_selected_idx])
-        fsz_add_btn.click(
-            fn=fsz_add_images,
-            inputs=[fsz_input_files, fsz_builder_gallery, det_size_in],
-            outputs=[fsz_builder_gallery, fsz_status],
-        )
-        fsz_cut_btn.click(
-            fn=fsz_cut_from_video,
-            inputs=[fsz_video_in, fsz_frame_num, fsz_builder_gallery, det_size_in],
-            outputs=[fsz_builder_gallery, fsz_status],
-        )
-        fsz_remove_btn.click(
-            fn=fsz_remove_selected,
-            inputs=[fsz_builder_gallery, fsz_selected_idx],
-            outputs=[fsz_builder_gallery, fsz_status],
-        )
-        fsz_clear_btn.click(
-            fn=fsz_clear_all,
-            outputs=[fsz_builder_gallery, fsz_status],
-        )
-        fsz_create_btn.click(
-            fn=fsz_build_and_apply,
-            inputs=[fsz_builder_gallery, fsz_name_in],
-            outputs=[fsz_download_box, source_in, active_faces_gallery, fsz_status],
-        )
-
-        all_params = [
-            source_in,
-            target_in,
-            frame_slider,
-            swapper_in,
-            swap_weight_in,
-            enhancer_in,
-            enhancer_blend_in,
-            eye_expr_in,
-            use_angle_rot_in,
-            use_parser_in,
-            use_xseg_in,
-            protect_mouth_in,
-            use_color_in,
-            use_temporal_in,
-            top_sharp_in,
-            face_mode_in,
-            det_size_in,
-            mask_blur_in,
-        ]
-
-        def on_target_uploaded(tgt):
-            total = get_video_frame_count(tgt)
-            return gr.update(minimum=0, maximum=max(0, total - 1), value=0), f"Video siap ({total} frame)."
-
-        target_in.change(fn=on_target_uploaded, inputs=[target_in], outputs=[frame_slider, preview_status])
-        frame_slider.release(fn=preview_single_frame, inputs=all_params, outputs=[preview_img, preview_status])
-        preview_btn.click(fn=preview_single_frame, inputs=all_params, outputs=[preview_img, preview_status])
-
-        render_params = [
-            source_in,
-            target_in,
-            swapper_in,
-            swap_weight_in,
-            enhancer_in,
-            enhancer_blend_in,
-            eye_expr_in,
-            use_angle_rot_in,
-            use_parser_in,
-            use_xseg_in,
-            protect_mouth_in,
-            use_color_in,
-            use_temporal_in,
-            top_sharp_in,
-            face_mode_in,
-            det_size_in,
-            mask_blur_in,
-        ]
-        run_btn.click(fn=run_render_full, inputs=render_params, outputs=[output_file_box, preview_status])
-
-    demo.queue(max_size=4).launch(share=share, debug=False)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Fast FaceSwap CUDA UI & CLI")
-    parser.add_argument("--no-share", action="store_true")
-    parser.add_argument("--no-gradio", action="store_true")
-    parser.add_argument("--skip-install", action="store_true")
-    parser.add_argument("--source", default="")
-    parser.add_argument("--target", default="")
-    parser.add_argument("--swapper", default="inswapper_128_fp16")
-    parser.add_argument("--enhancer", default="restoreformer++")
-    parser.add_argument("--enhancer-blend", type=float, default=0.30)
-    parser.add_argument("--eye-expr", type=float, default=0.35)
-    parser.add_argument("--temporal-smooth", action="store_true")
-    parser.add_argument("--top-sharp-fsz", action="store_true")
-    args = parser.parse_args()
-
-    if not args.skip_install:
-        ensure_packages(use_gradio=not args.no_gradio)
-
-    if args.no_gradio:
-        out_path, msg = run_render_full(
-            source_file=args.source,
-            target_file=args.target,
-            swapper_model=args.swapper,
-            swap_weight=1.0,
-            enhancer=args.enhancer,
-            enhancer_blend=args.enhancer_blend,
-            eye_expr_strength=args.eye_expr,
-            use_angle_rot=True,
-            use_face_parser=True,
-            use_xseg=True,
-            protect_mouth=True,
-            use_color_match=True,
-            use_temporal_smooth=args.temporal_smooth,
-            top_sharp_fsz=args.top_sharp_fsz,
-            face_mode="largest",
-            det_size=640,
-            mask_blur=13,
-        )
-        print(msg, flush=True)
-        return
-
-    launch_fast_ui(share=not args.no_share)
+    return demo
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--drive-workspace", default="/content/drive/MyDrive/faceswap_workspace")
+    parser.add_argument("--models-dir", default="/content/fast_fs/models")
+    parser.add_argument("--share", action="store_true")
+    parser.add_argument("--port", type=int, default=7860)
+    args, _ = parser.parse_known_args()
+
+    app = build_ui(
+        drive_workspace=args.drive_workspace,
+        models_dir=args.models_dir,
+    )
+    app.launch(share=args.share, server_port=args.port)
