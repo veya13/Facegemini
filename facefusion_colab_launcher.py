@@ -88,25 +88,37 @@ def setup_facefusion() -> None:
     run_cmd(f"{sys.executable} -m pip install -q -r requirements.txt")
 
 
-def patch_gradio_share() -> None:
-    """Mengaktifkan tautan publik gradio.live agar UI bisa dibuka dari browser HP/Colab."""
-    ui_core = WORK_DIR / "facefusion" / "uis" / "core.py"
-    if not ui_core.exists():
-        return
-    content = ui_core.read_text(encoding="utf-8", errors="ignore")
-    if "share = False" in content:
-        content = content.replace("share = False", "share = True")
-        ui_core.write_text(content, encoding="utf-8")
-        print("[PATCH] Mengaktifkan share=True pada UI FaceFusion.", flush=True)
+def create_share_wrapper() -> Path:
+    """Membuat runner yang memaksa gradio.Blocks.launch selalu memakai share=True."""
+    wrapper_path = WORK_DIR / "run_colab_share.py"
+    wrapper_code = """import sys
+import gradio as gr
+
+_orig_launch = gr.Blocks.launch
+
+def _patched_launch(self, *args, **kwargs):
+    kwargs["share"] = True
+    return _orig_launch(self, *args, **kwargs)
+
+gr.Blocks.launch = _patched_launch
+
+from facefusion import core
+if __name__ == "__main__":
+    sys.argv = ["facefusion.py", "run", "--execution-providers", "cuda"]
+    core.cli()
+"""
+    wrapper_path.write_text(wrapper_code, encoding="utf-8")
+    print("[PATCH] Wrapper share=True dibuat di run_colab_share.py", flush=True)
+    return wrapper_path
 
 
 def main() -> None:
     extract_fsz_archives()
     setup_facefusion()
-    patch_gradio_share()
+    wrapper = create_share_wrapper()
     os.chdir(WORK_DIR)
-    print("\n[START] Menjalankan FaceFusion 3.9.2 UI dengan akselerasi CUDA...", flush=True)
-    run_cmd(f"{sys.executable} facefusion.py run --execution-providers cuda")
+    print("\n[START] Menjalankan FaceFusion 3.9.2 UI dengan public link gradio.live...", flush=True)
+    run_cmd(f"{sys.executable} {wrapper.name}")
 
 
 if __name__ == "__main__":
