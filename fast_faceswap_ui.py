@@ -15,17 +15,18 @@ import numpy as np
 
 MODELS_DIR = Path("models")
 
-# Katalog model Face Swapper (256px, 512px, 128px) & Enhancer/Masker ONNX
 SWAPPER_URLS = {
+    "inswapper_128_fp16": [
+        "https://huggingface.co/facefusion/models-3.0.0/resolve/main/inswapper_128_fp16.onnx",
+        "https://huggingface.co/countfloyd/deepfake/resolve/main/inswapper_128_fp16.onnx",
+    ],
+    "inswapper_128": [
+        "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx",
+        "https://huggingface.co/deepinsight/inswapper/resolve/main/inswapper_128.onnx",
+    ],
     "hyperswap_1a_256": [
         "https://huggingface.co/facefusion/models-3.3.0/resolve/main/hyperswap_1a_256.onnx",
         "https://huggingface.co/facefusion/models-3.0.0/resolve/main/hyperswap_1a_256.onnx",
-    ],
-    "hyperswap_1b_256": [
-        "https://huggingface.co/facefusion/models-3.3.0/resolve/main/hyperswap_1b_256.onnx",
-    ],
-    "hyperswap_1c_256": [
-        "https://huggingface.co/facefusion/models-3.3.0/resolve/main/hyperswap_1c_256.onnx",
     ],
     "alphaface_256": [
         "https://huggingface.co/facefusion/models-3.3.0/resolve/main/alphaface_256.onnx",
@@ -36,17 +37,6 @@ SWAPPER_URLS = {
     ],
     "simswap_256": [
         "https://huggingface.co/facefusion/models-3.0.0/resolve/main/simswap_256.onnx",
-    ],
-    "simswap_unofficial_512": [
-        "https://huggingface.co/facefusion/models-3.0.0/resolve/main/simswap_unofficial_512.onnx",
-    ],
-    "inswapper_128_fp16": [
-        "https://huggingface.co/facefusion/models-3.0.0/resolve/main/inswapper_128_fp16.onnx",
-        "https://huggingface.co/countfloyd/deepfake/resolve/main/inswapper_128_fp16.onnx",
-    ],
-    "inswapper_128": [
-        "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx",
-        "https://huggingface.co/deepinsight/inswapper/resolve/main/inswapper_128.onnx",
     ],
 }
 
@@ -78,7 +68,6 @@ _CACHE: Dict[str, object] = {
     "source_face": None,
 }
 
-# Matriks referensi standar 5 titik landmark ArcFace (112x112)
 ARCFACE_DST = np.array(
     [
         [38.2946, 51.6963],
@@ -124,7 +113,6 @@ def align_face_crop(image: np.ndarray, kps: np.ndarray, crop_size: int) -> Tuple
     scale = crop_size / 112.0
     dst = ARCFACE_DST * scale
     if crop_size == 256:
-        # Penyesuaian proporsi crop FFHQ/HyperSwap 256
         dst = (ARCFACE_DST - 56.0) * (crop_size / 128.0) + (crop_size / 2.0)
     M, _ = cv2.estimateAffinePartial2D(kps.astype(np.float32), dst, method=cv2.LMEDS)
     aligned = cv2.warpAffine(image, M, (crop_size, crop_size), borderValue=0.0)
@@ -132,11 +120,10 @@ def align_face_crop(image: np.ndarray, kps: np.ndarray, crop_size: int) -> Tuple
 
 
 def match_color_lab(source_crop: np.ndarray, target_crop: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Menyamakan pencahayaan dan tone warna kulit wajah hasil swap dengan wajah asli target."""
     src_lab = cv2.cvtColor(source_crop, cv2.COLOR_BGR2LAB).astype(np.float32)
     tgt_lab = cv2.cvtColor(target_crop, cv2.COLOR_BGR2LAB).astype(np.float32)
 
-    valid = mask > 0.25
+    valid = mask > 0.35
     if np.count_nonzero(valid) < 50:
         return source_crop
 
@@ -152,8 +139,6 @@ def match_color_lab(source_crop: np.ndarray, target_crop: np.ndarray, mask: np.n
 
 
 class UniversalOnnxSwapper:
-    """Mendukung inswapper (128/fp16) sekaligus model 256px/512px (HyperSwap, AlphaFace, GHOST, SimSwap)."""
-
     def __init__(self, model_path: Path, model_name: str):
         import onnx
         import onnxruntime as ort
@@ -162,7 +147,6 @@ class UniversalOnnxSwapper:
         self.model_path = model_path
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
-        # Cek apakah model adalah inswapper standar dengan emap internal
         self.is_inswapper = "inswapper" in model_name.lower()
         self.emap = None
         if self.is_inswapper:
@@ -175,9 +159,7 @@ class UniversalOnnxSwapper:
 
         self.session = ort.InferenceSession(str(model_path), providers=providers)
         self.inputs = self.session.get_inputs()
-        self.input_names = [inp.name for inp in self.inputs]
 
-        # Deteksi ukuran resolusi input gambar (128, 256, atau 512)
         self.crop_size = 128
         for inp in self.inputs:
             if len(inp.shape) == 4 and isinstance(inp.shape[2], int):
@@ -213,8 +195,6 @@ class UniversalOnnxSwapper:
 
 
 class XSegMasker:
-    """Model Occlusion Masking (xseg.onnx) agar rambut, tangan, dan kacamata tidak tertimpa."""
-
     def __init__(self, model_path: Path):
         import onnxruntime as ort
 
@@ -287,10 +267,9 @@ def get_swapper(model_name: str) -> UniversalOnnxSwapper:
 
     urls = SWAPPER_URLS.get(model_name, [])
     mpath = download_from_list(f"{model_name}.onnx", urls, min_bytes=20_000_000)
-    if mpath is None and model_name != "inswapper_128":
-        print(f"[INFO] Model {model_name} tidak tersedia/gagal diunduh, beralih ke inswapper_128.", flush=True)
-        model_name = "inswapper_128"
-        mpath = download_from_list("inswapper_128.onnx", SWAPPER_URLS["inswapper_128"], min_bytes=50_000_000)
+    if mpath is None and model_name != "inswapper_128_fp16":
+        model_name = "inswapper_128_fp16"
+        mpath = download_from_list("inswapper_128_fp16.onnx", SWAPPER_URLS["inswapper_128_fp16"], min_bytes=20_000_000)
 
     if mpath is None:
         raise RuntimeError("Gagal mengunduh model Face Swapper ONNX.")
@@ -400,11 +379,12 @@ def process_face_advanced(
     swapper: UniversalOnnxSwapper,
     enhancer_obj: Optional[OnnxFaceEnhancer],
     xseg_obj: Optional[XSegMasker],
-    swap_weight: float = 0.85,
-    enhancer_blend: float = 0.25,
+    swap_weight: float = 1.0,
+    enhancer_blend: float = 0.30,
     use_color_match: bool = True,
     use_xseg: bool = True,
-    mask_blur: int = 19,
+    protect_mouth: bool = True,
+    mask_blur: int = 13,
 ) -> np.ndarray:
     h, w = frame.shape[:2]
     crop_size = swapper.crop_size
@@ -412,34 +392,49 @@ def process_face_advanced(
     aligned_tgt, M = align_face_crop(frame, face.kps, crop_size=crop_size)
     swapped_crop = swapper.swap_crop(aligned_tgt, src_face)
 
-    # Buat mask dasar berbentuk oval lembut di dalam kotak crop
+    # 1. Buat mask oval yang lebih luas ke bawah agar gerakan dagu & mulut terbuka tidak terpotong
     base_mask = np.zeros((crop_size, crop_size), dtype=np.float32)
-    pad = int(crop_size * 0.08)
     cv2.ellipse(
         base_mask,
-        center=(crop_size // 2, int(crop_size * 0.52)),
-        axes=(int(crop_size * 0.42), int(crop_size * 0.46)),
+        center=(crop_size // 2, int(crop_size * 0.55)),
+        axes=(int(crop_size * 0.44), int(crop_size * 0.50)),
         angle=0,
         startAngle=0,
         endAngle=360,
         color=1.0,
         thickness=-1,
     )
-    base_mask[:pad, :] = 0.0
-    base_mask[-pad:, :] = 0.0
+    top_pad = int(crop_size * 0.05)
+    bot_pad = int(crop_size * 0.03)
+    base_mask[:top_pad, :] = 0.0
+    base_mask[crop_size - bot_pad :, :] = 0.0
 
-    # Gabungkan dengan XSeg Occlusion Masking agar rambut, tangan, dan kacamata tidak tertimpa
+    # 2. Gabungkan dengan XSeg Occlusion Mask
     if use_xseg and xseg_obj is not None:
         occ_mask = xseg_obj.predict_mask(aligned_tgt)
+        # Cegah XSeg menghapus mulut terbuka/gigi yang sering salah dikira sebagai halangan
+        if protect_mouth:
+            mouth_zone = np.zeros((crop_size, crop_size), dtype=np.float32)
+            cv2.ellipse(
+                mouth_zone,
+                center=(crop_size // 2, int(crop_size * 0.78)),
+                axes=(int(crop_size * 0.24), int(crop_size * 0.14)),
+                angle=0,
+                startAngle=0,
+                endAngle=360,
+                color=1.0,
+                thickness=-1,
+            )
+            occ_mask = np.maximum(occ_mask, mouth_zone)
         combined_mask = base_mask * occ_mask
     else:
         combined_mask = base_mask
 
-    # Samakan warna kulit wajah baru dengan pencahayaan target
+    # 3. Samakan warna kulit dengan pencahayaan target
     if use_color_match:
         swapped_crop = match_color_lab(swapped_crop, aligned_tgt, combined_mask)
 
-    # Terapkan Face Enhancer (RestoreFormer++ / GPEN-512 / CodeFormer) pada crop wajah
+    # 4. Pertajam detail wajah & gigi/bibir menggunakan Face Enhancer
     if enhancer_obj is not None and enhancer_blend > 0.0:
         enhanced = enhancer_obj.enhance_crop(swapped_crop)
         eb = float(np.clip(enhancer_blend, 0.0, 1.0))
@@ -449,11 +444,10 @@ def process_face_advanced(
             255,
         ).astype(np.uint8)
 
-    # Haluskan tepi mask & atur Face Swapper Weight
+    # 5. Haluskan tepi luar saja agar bagian dalam (bibir/mata) tetap tajam & tidak tercampur
     k = max(5, int(mask_blur) | 1)
     soft_mask = cv2.GaussianBlur(combined_mask, (k, k), 0) * float(np.clip(swap_weight, 0.0, 1.0))
 
-    # Kembalikan crop wajah dan mask ke koordinat frame asli
     inv_M = cv2.invertAffineTransform(M)
     warped_face = cv2.warpAffine(swapped_crop, inv_M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
     warped_mask = cv2.warpAffine(soft_mask, inv_M, (w, h), flags=cv2.INTER_LINEAR, borderValue=0.0)[..., None]
@@ -494,6 +488,7 @@ def preview_single_frame(
     enhancer: str,
     enhancer_blend: float,
     use_xseg: bool,
+    protect_mouth: bool,
     use_color_match: bool,
     face_mode: str,
     det_size: int,
@@ -522,12 +517,12 @@ def preview_single_frame(
             cap.release()
             if not ret or frame is None:
                 return None, f"Gagal membaca frame ke-{safe_idx}."
-            status = f"Preview Frame {safe_idx + 1}/{total} | Model: {swapper.model_name} ({swapper.crop_size}px)"
+            status = f"Preview Frame {safe_idx + 1}/{total} | Model: {swapper.model_name}"
         else:
             frame = cv2.imread(str(target_path))
             if frame is None:
                 return None, "Gagal membaca gambar target."
-            status = f"Preview Gambar | Model: {swapper.model_name} ({swapper.crop_size}px)"
+            status = f"Preview Gambar | Model: {swapper.model_name}"
 
         out_frame = frame.copy()
         faces = select_target_faces(app.get(frame), mode=face_mode)
@@ -543,6 +538,7 @@ def preview_single_frame(
                 enhancer_blend=float(enhancer_blend),
                 use_color_match=bool(use_color_match),
                 use_xseg=bool(use_xseg),
+                protect_mouth=bool(protect_mouth),
                 mask_blur=int(mask_blur),
             )
 
@@ -559,6 +555,7 @@ def run_render_full(
     enhancer: str,
     enhancer_blend: float,
     use_xseg: bool,
+    protect_mouth: bool,
     use_color_match: bool,
     face_mode: str,
     det_size: int,
@@ -614,6 +611,7 @@ def run_render_full(
                     enhancer_blend=float(enhancer_blend),
                     use_color_match=bool(use_color_match),
                     use_xseg=bool(use_xseg),
+                    protect_mouth=bool(protect_mouth),
                     mask_blur=int(mask_blur),
                 )
             writer.write(out_frame)
@@ -656,6 +654,7 @@ def run_render_full(
             enhancer_blend=float(enhancer_blend),
             use_color_match=bool(use_color_match),
             use_xseg=bool(use_xseg),
+            protect_mouth=bool(protect_mouth),
             mask_blur=int(mask_blur),
         )
     img_out = out_dir / "hasil_swap.png"
@@ -670,26 +669,33 @@ def launch_fast_ui(share: bool = True) -> None:
     providers = ort.get_available_providers()
     gpu_status = "CUDA GPU AKTIF" if "CUDAExecutionProvider" in providers else "CPU MODE (Aktifkan T4 GPU!)"
 
-    # UI dibuat ringkas dan bersih agar terbuka cepat di browser HP tanpa lag
     with gr.Blocks(title="Fast FaceSwap CUDA UI") as demo:
         gr.Markdown(f"### Fast FaceSwap Pro UI — **{gpu_status}**")
 
         with gr.Row():
-            source_in = gr.File(label="Sumber Wajah (.jpg / .png / .fsz)", type="filepath")
-            target_in = gr.File(label="Video atau Foto Target", type="filepath")
+            source_in = gr.File(
+                label="Sumber Wajah (.jpg / .png / .fsz)",
+                type="filepath",
+            )
+            target_in = gr.File(
+                label="Video atau Foto Target",
+                type="filepath",
+            )
 
         with gr.Row():
             swapper_in = gr.Dropdown(
                 choices=list(SWAPPER_URLS.keys()),
-                value="hyperswap_1a_256",
-                label="Face Swapper Model (256px / 512px / 128px)",
+                value="inswapper_128_fp16",
+                label="Face Swapper Model",
+                info="inswapper_128_fp16 paling stabil untuk mulut & ekspresi bicara.",
             )
             swap_weight_in = gr.Slider(
                 minimum=0.1,
                 maximum=1.0,
                 step=0.05,
-                value=0.90,
+                value=1.0,
                 label="Face Swapper Weight",
+                info="Setel 1.0 agar wajah baru tidak transparan/tercampur bibir lama.",
             )
 
         with gr.Row():
@@ -697,23 +703,57 @@ def launch_fast_ui(share: bool = True) -> None:
                 choices=["restoreformer++", "gpen-512", "codeformer", "none"],
                 value="restoreformer++",
                 label="Face Enhancer",
+                info="Mempertajam detail gigi, bibir & mata setelah swap.",
             )
             enhancer_blend_in = gr.Slider(
                 minimum=0.0,
                 maximum=1.0,
                 step=0.05,
-                value=0.20,
-                label="Enhancer Blend (Kiri = Natural)",
+                value=0.30,
+                label="Enhancer Blend",
+                info="0.20–0.40 = tajam & natural; terlalu tinggi bisa terasa kaku.",
             )
 
         with gr.Row():
-            use_xseg_in = gr.Checkbox(value=True, label="XSeg Occlusion Mask (Rambut/Tangan/Kacamata)")
-            use_color_in = gr.Checkbox(value=True, label="Color Match (Samakan Warna Kulit)")
-            face_mode_in = gr.Dropdown(choices=["largest", "all"], value="largest", label="Target Wajah")
+            use_xseg_in = gr.Checkbox(
+                value=True,
+                label="XSeg Occlusion Mask",
+                info="Mencegah rambut/tangan/kacamata tertimpa wajah.",
+            )
+            protect_mouth_in = gr.Checkbox(
+                value=True,
+                label="Kunci Area Mulut (Anti-Hilang)",
+                info="Mencegah XSeg memotong bibir saat mulut terbuka/bicara.",
+            )
+            use_color_in = gr.Checkbox(
+                value=True,
+                label="Color Match (LAB)",
+                info="Menyamakan tone warna kulit dengan cahaya video.",
+            )
 
         with gr.Row():
-            det_size_in = gr.Slider(minimum=320, maximum=960, step=64, value=640, label="Det Size")
-            mask_blur_in = gr.Slider(minimum=5, maximum=45, step=2, value=19, label="Mask Blur")
+            face_mode_in = gr.Dropdown(
+                choices=["largest", "all"],
+                value="largest",
+                label="Target Wajah",
+                info="largest = wajah utama terbesar; all = semua wajah.",
+            )
+            det_size_in = gr.Slider(
+                minimum=320,
+                maximum=960,
+                step=64,
+                value=640,
+                label="Det Size (Presisi Landmark)",
+                info="640 paling presisi mengunci titik sudut bibir & mata.",
+            )
+            mask_blur_in = gr.Slider(
+                minimum=5,
+                maximum=35,
+                step=2,
+                value=13,
+                label="Mask Blur (Kehalusan Tepi)",
+                info="11–15 agar tepi pipi halus tapi mulut tetap tajam.",
+            )
 
         gr.Markdown("---")
         preview_img = gr.Image(label="Live Preview Hasil Per Frame", interactive=False)
@@ -734,6 +774,7 @@ def launch_fast_ui(share: bool = True) -> None:
             enhancer_in,
             enhancer_blend_in,
             use_xseg_in,
+            protect_mouth_in,
             use_color_in,
             face_mode_in,
             det_size_in,
@@ -756,6 +797,7 @@ def launch_fast_ui(share: bool = True) -> None:
             enhancer_in,
             enhancer_blend_in,
             use_xseg_in,
+            protect_mouth_in,
             use_color_in,
             face_mode_in,
             det_size_in,
