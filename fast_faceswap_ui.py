@@ -115,7 +115,7 @@ def align_face_crop(image: np.ndarray, kps: np.ndarray, crop_size: int) -> Tuple
     if crop_size == 256:
         dst = (ARCFACE_DST - 56.0) * (crop_size / 128.0) + (crop_size / 2.0)
     M, _ = cv2.estimateAffinePartial2D(kps.astype(np.float32), dst, method=cv2.LMEDS)
-    aligned = cv2.warpAffine(image, M, (crop_size, crop_size), borderValue=0.0)
+    aligned = cv2.warpAffine(image, M, (crop_size, crop_size), flags=cv2.INTER_CUBIC, borderValue=0.0)
     return aligned, M
 
 
@@ -136,6 +136,21 @@ def match_color_lab(source_crop: np.ndarray, target_crop: np.ndarray, mask: np.n
 
     matched = np.clip(src_lab, 0, 255).astype(np.uint8)
     return cv2.cvtColor(matched, cv2.COLOR_LAB2BGR)
+
+
+def sharpen_eye_region(crop_bgr: np.ndarray, amount: float = 0.35) -> np.ndarray:
+    """Mempertegas detail iris, pupil, dan kelopak mata agar arah tatapan tidak kabur."""
+    h, w = crop_bgr.shape[:2]
+    y1, y2 = int(h * 0.28), int(h * 0.56)
+    x1, x2 = int(w * 0.16), int(w * 0.84)
+    roi = crop_bgr[y1:y2, x1:x2]
+    if roi.size == 0:
+        return crop_bgr
+    blur = cv2.GaussianBlur(roi, (0, 0), 1.2)
+    sharp = cv2.addWeighted(roi, 1.0 + amount, blur, -amount, 0)
+    out = crop_bgr.copy()
+    out[y1:y2, x1:x2] = sharp
+    return out
 
 
 class UniversalOnnxSwapper:
@@ -380,10 +395,11 @@ def process_face_advanced(
     enhancer_obj: Optional[OnnxFaceEnhancer],
     xseg_obj: Optional[XSegMasker],
     swap_weight: float = 1.0,
-    enhancer_blend: float = 0.30,
+    enhancer_blend: float = 0.45,
     use_color_match: bool = True,
     use_xseg: bool = True,
     protect_mouth: bool = True,
+    protect_eyes: bool = True,
     mask_blur: int = 13,
 ) -> np.ndarray:
     h, w = frame.shape[:2]
@@ -392,7 +408,7 @@ def process_face_advanced(
     aligned_tgt, M = align_face_crop(frame, face.kps, crop_size=crop_size)
     swapped_crop = swapper.swap_crop(aligned_tgt, src_face)
 
-    # 1. Buat mask oval yang lebih luas ke bawah agar gerakan dagu & mulut terbuka tidak terpotong
+    # 1. Buat mask oval wajah
     base_mask = np.zeros((crop_size, crop_size), dtype=np.float32)
     cv2.ellipse(
         base_mask,
@@ -409,10 +425,9 @@ def process_face_advanced(
     base_mask[:top_pad, :] = 0.0
     base_mask[crop_size - bot_pad :, :] = 0.0
 
-    # 2. Gabungkan dengan XSeg Occlusion Mask
+    # 2. Gabungkan dengan XSeg Occlusion Mask + proteksi zona mata & mulut
     if use_xseg and xseg_obj is not None:
         occ_mask = xseg_obj.predict_mask(aligned_tgt)
-        # Cegah XSeg menghapus mulut terbuka/gigi yang sering salah dikira sebagai halangan
         if protect_mouth:
             mouth_zone = np.zeros((crop_size, crop_size), dtype=np.float32)
             cv2.ellipse(
@@ -426,6 +441,32 @@ def process_face_advanced(
                 thickness=-1,
             )
             occ_mask = np.maximum(occ_mask, mouth_zone)
+
+        if protect_eyes:
+            eye_zone = np.zeros((crop_size, crop_size), dtype=np.float32)
+            # Mata kiri & mata kanan pada koordinat aligned crop
+            cv2.ellipse(
+                eye_zone,
+                center=(int(crop_size * 0.34), int(crop_size * 0.45)),
+                axes=(int(crop_size * 0.14), int(crop_size * 0.08)),
+                angle=0,
+                startAngle=0,
+                endAngle=360,
+                color=1.0,
+                thickness=-1,
+            )
+            cv2.ellipse(
+                eye_zone,
+                center=(int(crop_size * 0.66), int(crop_size * 0.45)),
+                axes=(int(crop_size * 0.14), int(crop_size * 0.08)),
+                angle=0,
+                startAngle=0,
+                endAngle=360,
+                color=1.0,
+                thickness=-1,
+            )
+            occ_mask = np.maximum(occ_mask, eye_zone)
+
         combined_mask = base_mask * occ_mask
     else:
         combined_mask = base_mask
@@ -434,7 +475,9 @@ def process_face_advanced(
     if use_color_match:
         swapped_crop = match_color_lab(swapped_crop, aligned_tgt, combined_mask)
 
-    # 4. Pertajam detail wajah & gigi/bibir menggunakan Face Enhancer
+    # 4. Pertajam detail mata sebelum & sesudah enhancer agar pupil tidak blur
+    swapped_crop = sharpen_eye_region(swapped_crop, amount=0.35)
+
     if enhancer_obj is not None and enhancer_blend > 0.0:
         enhanced = enhancer_obj.enhance_crop(swapped_crop)
         eb = float(np.clip(enhancer_blend, 0.0, 1.0))
@@ -444,12 +487,12 @@ def process_face_advanced(
             255,
         ).astype(np.uint8)
 
-    # 5. Haluskan tepi luar saja agar bagian dalam (bibir/mata) tetap tajam & tidak tercampur
+    # 5. Haluskan tepi luar saja & gunakan INTER_CUBIC saat rotasi balik kepala miring
     k = max(5, int(mask_blur) | 1)
     soft_mask = cv2.GaussianBlur(combined_mask, (k, k), 0) * float(np.clip(swap_weight, 0.0, 1.0))
 
     inv_M = cv2.invertAffineTransform(M)
-    warped_face = cv2.warpAffine(swapped_crop, inv_M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+    warped_face = cv2.warpAffine(swapped_crop, inv_M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT_101)
     warped_mask = cv2.warpAffine(soft_mask, inv_M, (w, h), flags=cv2.INTER_LINEAR, borderValue=0.0)[..., None]
 
     out = warped_face.astype(np.float32) * warped_mask + frame.astype(np.float32) * (1.0 - warped_mask)
@@ -489,6 +532,7 @@ def preview_single_frame(
     enhancer_blend: float,
     use_xseg: bool,
     protect_mouth: bool,
+    protect_eyes: bool,
     use_color_match: bool,
     face_mode: str,
     det_size: int,
@@ -539,6 +583,7 @@ def preview_single_frame(
                 use_color_match=bool(use_color_match),
                 use_xseg=bool(use_xseg),
                 protect_mouth=bool(protect_mouth),
+                protect_eyes=bool(protect_eyes),
                 mask_blur=int(mask_blur),
             )
 
@@ -556,6 +601,7 @@ def run_render_full(
     enhancer_blend: float,
     use_xseg: bool,
     protect_mouth: bool,
+    protect_eyes: bool,
     use_color_match: bool,
     face_mode: str,
     det_size: int,
@@ -612,6 +658,7 @@ def run_render_full(
                     use_color_match=bool(use_color_match),
                     use_xseg=bool(use_xseg),
                     protect_mouth=bool(protect_mouth),
+                    protect_eyes=bool(protect_eyes),
                     mask_blur=int(mask_blur),
                 )
             writer.write(out_frame)
@@ -655,6 +702,7 @@ def run_render_full(
             use_color_match=bool(use_color_match),
             use_xseg=bool(use_xseg),
             protect_mouth=bool(protect_mouth),
+            protect_eyes=bool(protect_eyes),
             mask_blur=int(mask_blur),
         )
     img_out = out_dir / "hasil_swap.png"
@@ -687,7 +735,7 @@ def launch_fast_ui(share: bool = True) -> None:
                 choices=list(SWAPPER_URLS.keys()),
                 value="inswapper_128_fp16",
                 label="Face Swapper Model",
-                info="inswapper_128_fp16 paling stabil untuk mulut & ekspresi bicara.",
+                info="inswapper_128_fp16 paling stabil untuk sinkronisasi mata & mulut.",
             )
             swap_weight_in = gr.Slider(
                 minimum=0.1,
@@ -695,7 +743,7 @@ def launch_fast_ui(share: bool = True) -> None:
                 step=0.05,
                 value=1.0,
                 label="Face Swapper Weight",
-                info="Setel 1.0 agar wajah baru tidak transparan/tercampur bibir lama.",
+                info="Setel 1.0 agar bola mata & bibir tidak tembus wajah asli.",
             )
 
         with gr.Row():
@@ -703,22 +751,27 @@ def launch_fast_ui(share: bool = True) -> None:
                 choices=["restoreformer++", "gpen-512", "codeformer", "none"],
                 value="restoreformer++",
                 label="Face Enhancer",
-                info="Mempertajam detail gigi, bibir & mata setelah swap.",
+                info="restoreformer++ / gpen-512 mempertajam detail pupil & bulu mata.",
             )
             enhancer_blend_in = gr.Slider(
                 minimum=0.0,
                 maximum=1.0,
                 step=0.05,
-                value=0.30,
+                value=0.45,
                 label="Enhancer Blend",
-                info="0.20–0.40 = tajam & natural; terlalu tinggi bisa terasa kaku.",
+                info="0.40–0.55 membantu memperjelas arah bola mata di video redup/miring.",
             )
 
         with gr.Row():
             use_xseg_in = gr.Checkbox(
                 value=True,
                 label="XSeg Occlusion Mask",
-                info="Mencegah rambut/tangan/kacamata tertimpa wajah.",
+                info="Mencegah poni rambut/tangan/kacamata tertimpa wajah.",
+            )
+            protect_eyes_in = gr.Checkbox(
+                value=True,
+                label="Kunci Area Mata (Anti-Kabur)",
+                info="Mencegah XSeg membuat bola mata transparan saat kepala miring/redup.",
             )
             protect_mouth_in = gr.Checkbox(
                 value=True,
@@ -744,7 +797,7 @@ def launch_fast_ui(share: bool = True) -> None:
                 step=64,
                 value=640,
                 label="Det Size (Presisi Landmark)",
-                info="640 paling presisi mengunci titik sudut bibir & mata.",
+                info="640 paling presisi mengunci titik sudut mata & bibir.",
             )
             mask_blur_in = gr.Slider(
                 minimum=5,
@@ -752,7 +805,7 @@ def launch_fast_ui(share: bool = True) -> None:
                 step=2,
                 value=13,
                 label="Mask Blur (Kehalusan Tepi)",
-                info="11–15 agar tepi pipi halus tapi mulut tetap tajam.",
+                info="11–15 agar tepi pipi halus tapi mata & mulut tetap tajam.",
             )
 
         gr.Markdown("---")
@@ -775,6 +828,7 @@ def launch_fast_ui(share: bool = True) -> None:
             enhancer_blend_in,
             use_xseg_in,
             protect_mouth_in,
+            protect_eyes_in,
             use_color_in,
             face_mode_in,
             det_size_in,
@@ -798,6 +852,7 @@ def launch_fast_ui(share: bool = True) -> None:
             enhancer_blend_in,
             use_xseg_in,
             protect_mouth_in,
+            protect_eyes_in,
             use_color_in,
             face_mode_in,
             det_size_in,
