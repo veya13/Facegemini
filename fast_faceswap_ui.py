@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 
 MODELS_DIR = Path("models")
+FACESET_WORK_DIR = Path("faceset_workspace")
 
 SWAPPER_URLS = {
     "inswapper_128_fp16": [
@@ -71,6 +72,7 @@ _CACHE: Dict[str, object] = {
     "parser_obj": None,
     "source_key": None,
     "source_face": None,
+    "source_count": 0,
 }
 
 ARCFACE_DST = np.array(
@@ -173,11 +175,6 @@ def detect_faces_angle_aware(app, frame: np.ndarray, enable_rotation: bool = Tru
 
 
 class TemporalFaceTracker:
-    """
-    Menghaluskan pergerakan titik landmark antar-frame (EMA) dan menahan posisi
-    wajah dari frame sebelumnya jika deteksi sempat miss 1-3 frame akibat gerakan cepat.
-    """
-
     def __init__(self, alpha: float = 0.65, max_hold_frames: int = 3):
         self.alpha = float(np.clip(alpha, 0.2, 1.0))
         self.max_hold = int(max_hold_frames)
@@ -192,7 +189,6 @@ class TemporalFaceTracker:
             curr_bbox = np.array(largest.bbox[:4], dtype=np.float32)
 
             if self.prev_kps is not None:
-                # Reset smoothing jika wajah berpindah tempat terlalu jauh (ganti adegan/cut)
                 dist = float(np.mean(np.linalg.norm(curr_kps - self.prev_kps, axis=1)))
                 face_w = max(20.0, float(curr_bbox[2] - curr_bbox[0]))
                 if dist < face_w * 0.45:
@@ -213,7 +209,6 @@ class TemporalFaceTracker:
                 )
             ]
 
-        # Anti-Miss Frame Hold: gunakan koordinat terakhir jika baru miss <= max_hold frame
         if self.prev_kps is not None and self.missed_count < self.max_hold:
             self.missed_count += 1
             return [
@@ -519,6 +514,44 @@ def get_enhancer(enhancer_choice: str) -> Optional[OnnxFaceEnhancer]:
     return obj
 
 
+def inspect_source_gallery(source_file: Optional[str]) -> Tuple[List[str], str]:
+    """Mengekstrak dan menampilkan seluruh isi wajah di dalam .fsz atau foto tunggal untuk verifikasi."""
+    if not source_file:
+        return [], "Belum ada sumber wajah dipilih."
+
+    src_path = Path(source_file)
+    if not src_path.exists():
+        return [], "File sumber tidak ditemukan."
+
+    FACESET_WORK_DIR.mkdir(parents=True, exist_ok=True)
+    inspect_dir = FACESET_WORK_DIR / "active_preview"
+    if inspect_dir.exists():
+        shutil.rmtree(inspect_dir)
+    inspect_dir.mkdir(parents=True, exist_ok=True)
+
+    img_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+    saved_paths: List[str] = []
+
+    if src_path.suffix.lower() in {".fsz", ".zip"}:
+        with zipfile.ZipFile(src_path, "r") as zf:
+            idx = 0
+            for member in sorted(zf.infolist(), key=lambda m: m.filename):
+                if member.is_dir():
+                    continue
+                ext = Path(member.filename).suffix.lower()
+                if ext in img_exts:
+                    idx += 1
+                    out_f = inspect_dir / f"face_{idx:03d}{ext}"
+                    with zf.open(member) as s, open(out_f, "wb") as d:
+                        shutil.copyfileobj(s, d)
+                    saved_paths.append(str(out_f))
+        return saved_paths, f"Faceset terverifikasi: {len(saved_paths)} gambar wajah siap digabungkan."
+
+    out_f = inspect_dir / src_path.name
+    shutil.copy2(src_path, out_f)
+    return [str(out_f)], f"1 foto sumber aktif: {src_path.name}"
+
+
 def load_source_face(source_file: str, app, top_sharp_only: bool = False):
     src_path = Path(source_file)
     cache_key = f"{src_path.resolve()}_{src_path.stat().st_mtime}_{top_sharp_only}"
@@ -555,7 +588,6 @@ def load_source_face(source_file: str, app, top_sharp_only: bool = False):
         if not detected_faces:
             raise RuntimeError("Tidak ada wajah yang terdeteksi di dalam faceset (.fsz).")
 
-        # Jika top_sharp_only aktif, ambil 6 foto dengan skor deteksi tertinggi agar embedding tidak tumpul
         if top_sharp_only and len(detected_faces) > 6:
             detected_faces = sorted(
                 detected_faces,
@@ -573,6 +605,8 @@ def load_source_face(source_file: str, app, top_sharp_only: bool = False):
         )
         _CACHE["source_key"] = cache_key
         _CACHE["source_face"] = merged_face
+        _CACHE["source_count"] = len(raw_embs)
+        print(f"[FACESET AKTIF] Menggabungkan {len(raw_embs)} embedding wajah dari {src_path.name}", flush=True)
         return merged_face
 
     src_img = cv2.imread(str(src_path))
@@ -584,7 +618,167 @@ def load_source_face(source_file: str, app, top_sharp_only: bool = False):
     best_face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
     _CACHE["source_key"] = cache_key
     _CACHE["source_face"] = best_face
+    _CACHE["source_count"] = 1
     return best_face
+
+
+# ================= TOOLS PEMBUAT FACESET (.FSZ) =================
+
+
+def _crop_padded_face(img_bgr: np.ndarray, face, out_size: int = 256) -> np.ndarray:
+    """Memotong area wajah dengan margin proporsional 35% agar dahi, dagu, dan telinga tetap terjaga."""
+    h, w = img_bgr.shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in face.bbox[:4]]
+    bw, bh = x2 - x1, y2 - y1
+    cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+    side = max(bw, bh) * 1.45
+
+    nx1 = max(0, int(cx - side * 0.5))
+    ny1 = max(0, int(cy - side * 0.5))
+    nx2 = min(w, int(cx + side * 0.5))
+    ny2 = min(h, int(cy + side * 0.5))
+
+    crop = img_bgr[ny1:ny2, nx1:nx2]
+    if crop.size == 0:
+        return cv2.resize(img_bgr, (out_size, out_size))
+    return cv2.resize(crop, (out_size, out_size), interpolation=cv2.INTER_AREA)
+
+
+def fsz_add_images(
+    uploaded_files: Optional[List[str]],
+    current_gallery: Optional[List[str]],
+    det_size: int,
+) -> Tuple[List[str], str]:
+    if not uploaded_files:
+        return current_gallery or [], "Pilih satu atau beberapa foto terlebih dahulu."
+
+    app = get_face_analyser(det_size=int(det_size))
+    builder_dir = FACESET_WORK_DIR / "builder_items"
+    builder_dir.mkdir(parents=True, exist_ok=True)
+
+    items = list(current_gallery) if current_gallery else []
+    added = 0
+    for fpath in uploaded_files:
+        p = Path(fpath)
+        if p.suffix.lower() in {".fsz", ".zip"}:
+            with zipfile.ZipFile(p, "r") as zf:
+                for member in sorted(zf.infolist(), key=lambda m: m.filename):
+                    if member.is_dir():
+                        continue
+                    ext = Path(member.filename).suffix.lower()
+                    if ext in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
+                        added += 1
+                        out_f = builder_dir / f"crop_{len(items) + 1:03d}{ext}"
+                        with zf.open(member) as s, open(out_f, "wb") as d:
+                            shutil.copyfileobj(s, d)
+                        items.append(str(out_f))
+            continue
+
+        img = cv2.imread(str(p))
+        if img is None:
+            continue
+        faces = detect_faces_angle_aware(app, img, enable_rotation=True)
+        if not faces:
+            continue
+        best = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        crop = _crop_padded_face(img, best, out_size=256)
+        added += 1
+        out_f = builder_dir / f"crop_{len(items) + 1:03d}.png"
+        cv2.imwrite(str(out_f), crop)
+        items.append(str(out_f))
+
+    return items, f"Berhasil menambahkan {added} potongan wajah. Total dalam daftar: {len(items)} wajah."
+
+
+def fsz_cut_from_video(
+    video_file: Optional[str],
+    frame_num: int,
+    current_gallery: Optional[List[str]],
+    det_size: int,
+) -> Tuple[List[str], str]:
+    if not video_file:
+        return current_gallery or [], "Unggah video terlebih dahulu untuk memotong wajah dari frame."
+
+    cap = cv2.VideoCapture(str(video_file))
+    if not cap.isOpened():
+        return current_gallery or [], "Gagal membuka video."
+    total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+    safe_idx = max(0, min(total - 1, int(frame_num)))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, safe_idx)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret or frame is None:
+        return current_gallery or [], f"Gagal membaca frame ke-{safe_idx}."
+
+    app = get_face_analyser(det_size=int(det_size))
+    faces = detect_faces_angle_aware(app, frame, enable_rotation=True)
+    if not faces:
+        return current_gallery or [], f"Tidak ada wajah terdeteksi pada frame {safe_idx + 1}."
+
+    builder_dir = FACESET_WORK_DIR / "builder_items"
+    builder_dir.mkdir(parents=True, exist_ok=True)
+    items = list(current_gallery) if current_gallery else []
+
+    for face in faces:
+        crop = _crop_padded_face(frame, face, out_size=256)
+        out_f = builder_dir / f"vid_f{safe_idx + 1}_{len(items) + 1:03d}.png"
+        cv2.imwrite(str(out_f), crop)
+        items.append(str(out_f))
+
+    return items, f"Berhasil mengambil {len(faces)} wajah dari frame {safe_idx + 1}. Total: {len(items)} wajah."
+
+
+def fsz_remove_selected(current_gallery: Optional[List[str]], selected_idx: Optional[int]) -> Tuple[List[str], str]:
+    items = list(current_gallery) if current_gallery else []
+    if not items:
+        return [], "Daftar faceset sudah kosong."
+    if selected_idx is None or selected_idx < 0 or selected_idx >= len(items):
+        # Jika tidak ada indeks dipilih, hapus item terakhir
+        items.pop()
+    else:
+        items.pop(selected_idx)
+    return items, f"1 wajah dihapus. Sisa dalam daftar: {len(items)} wajah."
+
+
+def fsz_clear_all() -> Tuple[List[str], str]:
+    builder_dir = FACESET_WORK_DIR / "builder_items"
+    if builder_dir.exists():
+        shutil.rmtree(builder_dir)
+    return [], "Semua wajah di daftar faceset telah dibersihkan."
+
+
+def fsz_build_and_apply(
+    current_gallery: Optional[List[str]],
+    faceset_name: str,
+) -> Tuple[Optional[str], Optional[str], List[str], str]:
+    items = list(current_gallery) if current_gallery else []
+    if not items:
+        return None, None, [], "Daftar wajah kosong. Tambahkan minimal 1 foto/frame terlebih dahulu."
+
+    clean_name = "".join(c for c in (faceset_name or "custom_faceset") if c.isalnum() or c in ("_", "-")).strip()
+    if not clean_name:
+        clean_name = "custom_faceset"
+
+    out_dir = Path("output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fsz_path = out_dir / f"{clean_name}.fsz"
+
+    with zipfile.ZipFile(fsz_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for i, item_path in enumerate(items, start=1):
+            p = Path(item_path)
+            if p.exists():
+                zf.write(p, arcname=f"face_{i:03d}{p.suffix.lower()}")
+
+    preview_list, verify_msg = inspect_source_gallery(str(fsz_path))
+    return (
+        str(fsz_path),
+        str(fsz_path),
+        preview_list,
+        f"Faceset '{fsz_path.name}' selesai dibuat ({len(items)} wajah) & langsung dipasang sebagai Sumber Wajah!",
+    )
+
+
+# ================= PROSES FACE SWAP =================
 
 
 def process_face_advanced(
@@ -720,7 +914,7 @@ def preview_single_frame(
 ) -> Tuple[Optional[np.ndarray], str]:
     try:
         if not source_file or not target_file:
-            return None, "Unggah Sumber Wajah (.jpg/.png/.fsz) dan Target, lalu klik Cek Preview."
+            return None, "Unggah / buat Sumber Wajah (.jpg/.png/.fsz) dan Target, lalu klik Cek Preview."
 
         app = get_face_analyser(det_size=int(det_size))
         swapper = get_swapper(swapper_model)
@@ -728,6 +922,7 @@ def preview_single_frame(
         xseg_obj = get_xseg() if use_xseg else None
         parser_obj = get_face_parser() if use_face_parser else None
         src_face = load_source_face(source_file, app, top_sharp_only=bool(top_sharp_fsz))
+        src_cnt = int(_CACHE.get("source_count", 1))
 
         target_path = Path(target_file)
         video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
@@ -738,14 +933,13 @@ def preview_single_frame(
             total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
             safe_idx = max(0, min(total - 1, int(frame_index)))
 
-            # Jika temporal smooth aktif, baca 2 frame sebelumnya agar smoothing bekerja di preview
             tracker = TemporalFaceTracker() if use_temporal_smooth else None
             start_idx = max(0, safe_idx - 2) if use_temporal_smooth else safe_idx
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
 
             frame = None
             faces = []
-            for cur_i in range(start_idx, safe_idx + 1):
+            for _ in range(start_idx, safe_idx + 1):
                 ret, f_img = cap.read()
                 if not ret or f_img is None:
                     break
@@ -759,14 +953,14 @@ def preview_single_frame(
             cap.release()
             if frame is None:
                 return None, f"Gagal membaca frame ke-{safe_idx}."
-            status = f"Preview Frame {safe_idx + 1}/{total} | Model: {swapper.model_name}"
+            status = f"Frame {safe_idx + 1}/{total} | {src_cnt} wajah sumber digabung | Model: {swapper.model_name}"
         else:
             frame = cv2.imread(str(target_path))
             if frame is None:
                 return None, "Gagal membaca gambar target."
             raw_f = detect_faces_angle_aware(app, frame, enable_rotation=bool(use_angle_rot))
             faces = select_target_faces(raw_f, mode=face_mode)
-            status = f"Preview Gambar | Model: {swapper.model_name}"
+            status = f"Preview Gambar | {src_cnt} wajah sumber digabung | Model: {swapper.model_name}"
 
         out_frame = frame.copy()
         if not faces:
@@ -824,6 +1018,7 @@ def run_render_full(
     xseg_obj = get_xseg() if use_xseg else None
     parser_obj = get_face_parser() if use_face_parser else None
     src_face = load_source_face(source_file, app, top_sharp_only=bool(top_sharp_fsz))
+    src_cnt = int(_CACHE.get("source_count", 1))
 
     target_path = Path(target_file)
     out_dir = Path("output")
@@ -883,7 +1078,7 @@ def run_render_full(
                 gc.collect()
                 if progress is not None:
                     progress((idx, total), desc=f"Merender frame {idx}/{total}")
-                print(f"[CUDA RENDER] Frame {idx}/{total}", flush=True)
+                print(f"[CUDA RENDER] Frame {idx}/{total} ({src_cnt} wajah sumber)", flush=True)
 
         cap.release()
         writer.release()
@@ -898,7 +1093,7 @@ def run_render_full(
             temp_video.unlink(missing_ok=True)
         else:
             shutil.move(str(temp_video), str(out_path))
-        return str(out_path), f"Selesai ({total} frame) -> {out_path}"
+        return str(out_path), f"Selesai ({total} frame, {src_cnt} wajah digabung) -> {out_path}"
 
     tgt_img = cv2.imread(str(target_path))
     if tgt_img is None:
@@ -926,7 +1121,7 @@ def run_render_full(
         )
     img_out = out_dir / "hasil_swap.png"
     cv2.imwrite(str(img_out), out)
-    return str(img_out), f"Selesai -> {img_out}"
+    return str(img_out), f"Selesai ({src_cnt} wajah digabung) -> {img_out}"
 
 
 def launch_fast_ui(share: bool = True) -> None:
@@ -936,18 +1131,58 @@ def launch_fast_ui(share: bool = True) -> None:
     providers = ort.get_available_providers()
     gpu_status = "CUDA GPU AKTIF" if "CUDAExecutionProvider" in providers else "CPU MODE (Aktifkan T4 GPU!)"
 
-    with gr.Blocks(title="Fast FaceSwap CUDA UI") as demo:
-        gr.Markdown(f"### Fast FaceSwap Pro UI — **{gpu_status}**")
+    with gr.Blocks(title="Fast FaceSwap CUDA UI + Faceset Studio") as demo:
+        gr.Markdown(f"### Fast FaceSwap Pro UI & Faceset Studio — **{gpu_status}**")
 
         with gr.Row():
             source_in = gr.File(
-                label="Sumber Wajah (.jpg / .png / .fsz)",
+                label="Sumber Wajah Aktif (.jpg / .png / .fsz)",
                 type="filepath",
             )
             target_in = gr.File(
                 label="Video atau Foto Target",
                 type="filepath",
             )
+
+        # Galeri verifikasi otomatis isi faceset aktif agar yakin semua foto terbaca
+        active_faces_gallery = gr.Gallery(
+            label="Verifikasi Isi Wajah Aktif (Semua foto di bawah ini digabung)",
+            columns=5,
+            height="auto",
+            object_fit="contain",
+        )
+        active_faces_info = gr.Textbox(label="Info Wajah Sumber", interactive=False)
+
+        # Menu lipat pembuat faceset.fsz langsung di halaman yang sama tanpa pindah tab
+        with gr.Accordion("Tools: Buat / Edit Faceset (.fsz) & Potong Wajah dari Video", open=False):
+            gr.Markdown("Gabungkan beberapa foto sudut wajah atau potong langsung dari frame video menjadi satu file `.fsz`.")
+            fsz_input_files = gr.File(
+                label="1. Input Files (Pilih banyak foto sekaligus atau file .fsz lama)",
+                file_count="multiple",
+                type="filepath",
+            )
+            fsz_add_btn = gr.Button("Tambahkan Foto ke Daftar Faceset", variant="secondary")
+
+            with gr.Row():
+                fsz_video_in = gr.File(label="2. Cut Face from Video Frame (Opsional)", type="filepath")
+                fsz_frame_num = gr.Number(value=0, precision=0, label="Nomor Frame Video")
+            fsz_cut_btn = gr.Button("Use Faces from This Frame (Potong Wajah dari Frame)", variant="secondary")
+
+            fsz_builder_gallery = gr.Gallery(
+                label="Faces in this Faceset (Klik gambar untuk memilih sebelum dihapus)",
+                columns=4,
+                height="auto",
+                object_fit="contain",
+            )
+            fsz_selected_idx = gr.State(value=None)
+            fsz_name_in = gr.Textbox(value="faceset_multi_sudut", label="Nama File Output (.fsz)")
+
+            with gr.Row():
+                fsz_remove_btn = gr.Button("Remove Selected", variant="secondary")
+                fsz_clear_btn = gr.Button("Clear All", variant="stop")
+            fsz_create_btn = gr.Button("Create / Update Faceset & Pakai Langsung", variant="primary")
+            fsz_status = gr.Textbox(label="Status Faceset Studio", interactive=False)
+            fsz_download_box = gr.File(label="Download File .fsz Hasil")
 
         with gr.Row():
             swapper_in = gr.Dropdown(
@@ -1059,8 +1294,45 @@ def launch_fast_ui(share: bool = True) -> None:
             preview_btn = gr.Button("Cek Preview Frame", variant="secondary")
             run_btn = gr.Button("Render Video Lengkap", variant="primary")
 
-        preview_status = gr.Textbox(label="Status", interactive=False)
+        preview_status = gr.Textbox(label="Status Render / Preview", interactive=False)
         output_file_box = gr.File(label="Download Hasil")
+
+        # Event verifikasi otomatis setiap kali file sumber diunggah
+        source_in.change(
+            fn=inspect_source_gallery,
+            inputs=[source_in],
+            outputs=[active_faces_gallery, active_faces_info],
+        )
+
+        # Event Faceset Studio
+        def on_gallery_select(evt: gr.SelectData):
+            return evt.index
+
+        fsz_builder_gallery.select(fn=on_gallery_select, outputs=[fsz_selected_idx])
+        fsz_add_btn.click(
+            fn=fsz_add_images,
+            inputs=[fsz_input_files, fsz_builder_gallery, det_size_in],
+            outputs=[fsz_builder_gallery, fsz_status],
+        )
+        fsz_cut_btn.click(
+            fn=fsz_cut_from_video,
+            inputs=[fsz_video_in, fsz_frame_num, fsz_builder_gallery, det_size_in],
+            outputs=[fsz_builder_gallery, fsz_status],
+        )
+        fsz_remove_btn.click(
+            fn=fsz_remove_selected,
+            inputs=[fsz_builder_gallery, fsz_selected_idx],
+            outputs=[fsz_builder_gallery, fsz_status],
+        )
+        fsz_clear_btn.click(
+            fn=fsz_clear_all,
+            outputs=[fsz_builder_gallery, fsz_status],
+        )
+        fsz_create_btn.click(
+            fn=fsz_build_and_apply,
+            inputs=[fsz_builder_gallery, fsz_name_in],
+            outputs=[fsz_download_box, source_in, active_faces_gallery, fsz_status],
+        )
 
         all_params = [
             source_in,
