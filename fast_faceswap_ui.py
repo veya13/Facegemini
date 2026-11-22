@@ -1362,6 +1362,11 @@ def run_render_full(
             start_idx = 0
             seg_num = 0
 
+        if start_idx >= total and seg_num > 0:
+            ok, final_path_str = ckpt_mgr.finalize_video(job_id, target_path, out_name="hasil_swap.mp4")
+            if ok:
+                return final_path_str, f"Selesai ({total} frame, {src_cnt} wajah digabung) -> {final_path_str} (segmen temp dibersihkan)"
+
         if start_idx < 0 or start_idx >= total:
             start_idx = 0
             seg_num = 0
