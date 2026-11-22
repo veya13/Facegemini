@@ -144,8 +144,24 @@ def compute_job_id(source_file: str, target_file: str) -> str:
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
 
 
+def inspect_valid_mp4(video_path: Path) -> Tuple[bool, int]:
+    """Memastikan file MP4 memiliki moov atom valid dan bisa dibaca minimal 1 frame."""
+    if not video_path.exists() or video_path.stat().st_size < 1024:
+        return False, 0
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        cap.release()
+        return False, 0
+    f_cnt = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    ret, _ = cap.read()
+    cap.release()
+    if not ret or f_cnt <= 0:
+        return False, 0
+    return True, f_cnt
+
+
 class DriveSegmentCheckpoint:
-    """Menyimpan input persisten, segmen sementara & progres di Google Drive agar tahan disconnect, lalu menghapus segmen setelah hasil akhir jadi."""
+    """Menyimpan input persisten, segmen sementara & progres di Google Drive secara atomik agar bebas moov atom error saat disconnect."""
 
     def __init__(self, workspace_root: Optional[Path] = None):
         root = workspace_root or DEFAULT_DRIVE_WORKSPACE
@@ -184,7 +200,9 @@ class DriveSegmentCheckpoint:
             sig = hashlib.md5(f"{prefix}|{stat.st_size}".encode("utf-8")).hexdigest()[:10]
             dst = self.inputs_dir / f"{prefix}_{sig}{ext}"
             if not dst.exists() or dst.stat().st_size != stat.st_size:
-                shutil.copy2(str(src), str(dst))
+                tmp_dst = self.inputs_dir / f".tmp_{prefix}_{sig}{ext}"
+                shutil.copy2(str(src), str(tmp_dst))
+                os.replace(str(tmp_dst), str(dst))
             return str(dst.resolve())
         except Exception:
             return str(src.resolve()) if src.exists() else None
@@ -196,6 +214,30 @@ class DriveSegmentCheckpoint:
 
     def state_path(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "render_state.json"
+
+    def get_clean_valid_segments(self, job_id: str) -> Tuple[List[Path], int]:
+        """Membersihkan file .mp4 korup (tanpa moov atom) di folder segmen dan mengembalikan daftar segmen valid + total frame."""
+        d = self.job_dir(job_id)
+        for junk in d.glob("_tmp_*"):
+            try:
+                junk.unlink()
+            except Exception:
+                pass
+
+        valid_segs: List[Path] = []
+        total_valid_frames = 0
+        for p in sorted(d.glob("part_*.mp4")):
+            ok, f_cnt = inspect_valid_mp4(p)
+            if ok:
+                valid_segs.append(p)
+                total_valid_frames += f_cnt
+            else:
+                print(f"[CLEANUP] Menghapus segmen terpotong/korup akibat disconnect: {p.name}", flush=True)
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+        return valid_segs, total_valid_frames
 
     def load_job_state(self, job_id: str) -> Optional[Dict[str, Any]]:
         p = self.state_path(job_id)
@@ -253,36 +295,45 @@ class DriveSegmentCheckpoint:
 
     def finalize_video(self, job_id: str, target_path: Path, out_name: str = "hasil_swap.mp4") -> Tuple[bool, str]:
         d = self.job_dir(job_id)
-        segs = [p for p in sorted(d.glob("part_*.mp4")) if p.exists() and p.stat().st_size > 0]
+        segs, _ = self.get_clean_valid_segments(job_id)
         if not segs:
             return False, "Tidak ada segmen valid ditemukan."
 
-        concat_txt = d / "concat_list.txt"
-        with open(concat_txt, "w", encoding="utf-8") as f:
-            for s in segs:
-                f.write(f"file '{s.resolve().as_posix()}'\n")
+        local_tmp_dir = Path(tempfile.mkdtemp(prefix="faceswap_merge_"))
+        try:
+            concat_txt = local_tmp_dir / "concat_list.txt"
+            with open(concat_txt, "w", encoding="utf-8") as f:
+                for s in segs:
+                    f.write(f"file '{s.resolve().as_posix()}'\n")
 
-        merged_raw = d / "_merged_raw.mp4"
-        rc_concat = run_cmd(
-            f'ffmpeg -y -f concat -safe 0 -i "{concat_txt}" -c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p "{merged_raw}"'
-        )
-        if rc_concat != 0 or not merged_raw.exists() or merged_raw.stat().st_size == 0:
-            return False, "Gagal menggabungkan potongan segmen."
+            merged_raw = local_tmp_dir / "_merged_raw.mp4"
+            rc_concat = run_cmd(
+                f'ffmpeg -y -f concat -safe 0 -i "{concat_txt}" -c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p "{merged_raw}"'
+            )
+            if rc_concat != 0 or not merged_raw.exists() or merged_raw.stat().st_size == 0:
+                return False, "Gagal menggabungkan potongan segmen."
 
-        final_out = self.output_dir / out_name
-        mux_cmd = (
-            f'ffmpeg -y -i "{merged_raw}" -i "{target_path}" '
-            f'-c:v copy -c:a aac -map 0:v:0 -map 1:a? -shortest "{final_out}"'
-        )
-        rc_mux = run_cmd(mux_cmd)
-        if rc_mux != 0 or not final_out.exists() or final_out.stat().st_size == 0:
-            shutil.move(str(merged_raw), str(final_out))
+            local_final = local_tmp_dir / out_name
+            mux_cmd = (
+                f'ffmpeg -y -i "{merged_raw}" -i "{target_path}" '
+                f'-c:v copy -c:a aac -map 0:v:0 -map 1:a? -shortest "{local_final}"'
+            )
+            rc_mux = run_cmd(mux_cmd)
+            if rc_mux != 0 or not local_final.exists() or local_final.stat().st_size == 0:
+                shutil.move(str(merged_raw), str(local_final))
 
-        if final_out.exists() and final_out.stat().st_size > 0:
-            self.clear_job(job_id)
-            return True, str(final_out.resolve())
+            final_out = self.output_dir / out_name
+            tmp_drive_out = self.output_dir / f".tmp_{out_name}"
+            shutil.copy2(str(local_final), str(tmp_drive_out))
+            os.replace(str(tmp_drive_out), str(final_out))
 
-        return False, "Hasil akhir gagal disimpan."
+            if final_out.exists() and final_out.stat().st_size > 0:
+                self.clear_job(job_id)
+                return True, str(final_out.resolve())
+
+            return False, "Hasil akhir gagal disimpan ke Drive."
+        finally:
+            shutil.rmtree(local_tmp_dir, ignore_errors=True)
 
 
 _CHECKPOINT_MGR: Optional[DriveSegmentCheckpoint] = None
@@ -1191,7 +1242,7 @@ def run_render_full(
     face_mode: str,
     det_size: int,
     mask_blur: int,
-    segment_frames: int = 250,
+    segment_frames: int = 100,
     fresh_start: bool = False,
     progress=None,
 ):
@@ -1274,22 +1325,16 @@ def run_render_full(
         }
 
         if prev_state and not prev_state.get("completed", False):
-            valid_segs = sorted([p for p in job_dir.glob("part_*.mp4") if p.exists() and p.stat().st_size > 0])
-            counted_frames = 0
-            for s_path in valid_segs:
-                c_s = cv2.VideoCapture(str(s_path))
-                if c_s.isOpened():
-                    counted_frames += max(0, int(c_s.get(cv2.CAP_PROP_FRAME_COUNT)))
-                c_s.release()
-
-            state_idx = int(prev_state.get("last_completed_idx", 0))
-            start_idx = counted_frames if counted_frames > 0 else state_idx
+            valid_segs, counted_frames = ckpt_mgr.get_clean_valid_segments(job_id)
+            start_idx = counted_frames
             seg_num = len(valid_segs)
             print(
-                f"[AUTO-RESUME] Melanjutkan otomatis dari frame {start_idx + 1}/{total} ({seg_num} segmen tersimpan di Drive)...",
+                f"[AUTO-RESUME] Melanjutkan otomatis dari frame {start_idx + 1}/{total} ({seg_num} segmen valid tersimpan di Drive)...",
                 flush=True,
             )
         else:
+            ckpt_mgr.clear_job(job_id)
+            job_dir = ckpt_mgr.job_dir(job_id)
             start_idx = 0
             seg_num = 0
 
@@ -1312,64 +1357,76 @@ def run_render_full(
         curr_start = start_idx
         while curr_start < total:
             curr_end = min(total, curr_start + seg_step)
-            seg_file = job_dir / f"part_{seg_num:04d}.mp4"
-            if seg_file.exists():
-                seg_file.unlink()
+            final_seg_file = job_dir / f"part_{seg_num:04d}.mp4"
+            if final_seg_file.exists():
+                final_seg_file.unlink()
 
-            writer = cv2.VideoWriter(str(seg_file), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+            # Tulis ke disk lokal (/tmp) dulu agar Google Drive tidak pernah berisi file MP4 setengah jadi (tanpa moov atom)
+            local_seg_fd, local_seg_path_str = tempfile.mkstemp(prefix=f"seg_{seg_num:04d}_", suffix=".mp4")
+            os.close(local_seg_fd)
+            local_seg_file = Path(local_seg_path_str)
+
+            writer = cv2.VideoWriter(str(local_seg_file), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
             cap = cv2.VideoCapture(str(target_path))
             cap.set(cv2.CAP_PROP_POS_FRAMES, curr_start)
 
             processed_this_seg = 0
             last_done_idx = curr_start
-            for idx in range(curr_start, curr_end):
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    break
+            try:
+                for idx in range(curr_start, curr_end):
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        break
 
-                out_frame = frame.copy()
-                raw_faces = detect_faces_angle_aware(app, frame, enable_rotation=bool(use_angle_rot))
-                if tracker is not None:
-                    faces = tracker.update(raw_faces)
-                else:
-                    faces = select_target_faces(raw_faces, mode=face_mode)
+                    out_frame = frame.copy()
+                    raw_faces = detect_faces_angle_aware(app, frame, enable_rotation=bool(use_angle_rot))
+                    if tracker is not None:
+                        faces = tracker.update(raw_faces)
+                    else:
+                        faces = select_target_faces(raw_faces, mode=face_mode)
 
-                for face in faces:
-                    out_frame = process_face_advanced(
-                        out_frame,
-                        face,
-                        src_face,
-                        swapper=swapper,
-                        enhancer_obj=enhancer_obj,
-                        xseg_obj=xseg_obj,
-                        parser_obj=parser_obj,
-                        swap_weight=float(swap_weight),
-                        enhancer_blend=float(enhancer_blend),
-                        eye_expr_strength=float(eye_expr_strength),
-                        use_color_match=bool(use_color_match),
-                        use_xseg=bool(use_xseg),
-                        use_face_parser=bool(use_face_parser),
-                        protect_mouth=bool(protect_mouth),
-                        mask_blur=int(mask_blur),
-                    )
-                writer.write(out_frame)
-                processed_this_seg += 1
-                last_done_idx = idx + 1
+                    for face in faces:
+                        out_frame = process_face_advanced(
+                            out_frame,
+                            face,
+                            src_face,
+                            swapper=swapper,
+                            enhancer_obj=enhancer_obj,
+                            xseg_obj=xseg_obj,
+                            parser_obj=parser_obj,
+                            swap_weight=float(swap_weight),
+                            enhancer_blend=float(enhancer_blend),
+                            eye_expr_strength=float(eye_expr_strength),
+                            use_color_match=bool(use_color_match),
+                            use_xseg=bool(use_xseg),
+                            use_face_parser=bool(use_face_parser),
+                            protect_mouth=bool(protect_mouth),
+                            mask_blur=int(mask_blur),
+                        )
+                    writer.write(out_frame)
+                    processed_this_seg += 1
+                    last_done_idx = idx + 1
 
-                if processed_this_seg % 10 == 0 or last_done_idx == curr_end:
-                    release_mem(clean_cuda=(processed_this_seg % 50 == 0))
-                    if progress is not None:
-                        progress((last_done_idx, total), desc=f"Merender frame {last_done_idx}/{total}")
-                    print(
-                        f"[CUDA RENDER] Frame {last_done_idx}/{total} | Segmen #{seg_num + 1} ({src_cnt} wajah sumber)",
-                        flush=True,
-                    )
+                    if processed_this_seg % 10 == 0 or last_done_idx == curr_end:
+                        release_mem(clean_cuda=(processed_this_seg % 50 == 0))
+                        if progress is not None:
+                            progress((last_done_idx, total), desc=f"Merender frame {last_done_idx}/{total}")
+                        print(
+                            f"[CUDA RENDER] Frame {last_done_idx}/{total} | Segmen #{seg_num + 1} ({src_cnt} wajah sumber)",
+                            flush=True,
+                        )
+            finally:
+                cap.release()
+                writer.release()
 
-            cap.release()
-            writer.release()
+            # Pindahkan segmen yang sudah tertutup sempurna (valid moov atom) secara atomik ke Google Drive
+            ok_seg, _ = inspect_valid_mp4(local_seg_file)
+            if processed_this_seg > 0 and ok_seg:
+                drive_tmp_seg = job_dir / f"_tmp_part_{seg_num:04d}.mp4"
+                shutil.copy2(str(local_seg_file), str(drive_tmp_seg))
+                os.replace(str(drive_tmp_seg), str(final_seg_file))
+                local_seg_file.unlink(missing_ok=True)
 
-            # Simpan state hanya setelah segmen video tertutup sempurna (writer.release) agar tidak korup saat disconnect
-            if processed_this_seg > 0 and seg_file.exists() and seg_file.stat().st_size > 0:
                 ckpt_mgr.save_job_state(
                     job_id,
                     {
@@ -1381,6 +1438,9 @@ def run_render_full(
                         "settings": settings_snapshot,
                     },
                 )
+            else:
+                local_seg_file.unlink(missing_ok=True)
+                raise RuntimeError("Segmen gagal ditutup secara valid.")
 
             release_mem(clean_cuda=True)
 
@@ -1452,10 +1512,11 @@ def launch_fast_ui(share: bool = True) -> None:
     def initial_resume_banner() -> str:
         latest = ckpt_mgr.find_latest_unfinished()
         if latest:
-            done_f = int(latest.get("last_completed_idx", 0))
+            jid = latest.get("job_id", "")
+            _, valid_cnt = ckpt_mgr.get_clean_valid_segments(jid) if jid else ([], int(latest.get("last_completed_idx", 0)))
             tot_f = int(latest.get("total_frames", 0))
             return (
-                f"Auto-Resume aktif: progres sampai frame {done_f}/{tot_f} tersimpan di Google Drive. "
+                f"Auto-Resume aktif: {valid_cnt}/{tot_f} frame valid tersimpan di Google Drive. "
                 f"Klik 'Render Video Lengkap' untuk menyambung, atau klik 'Hapus History & File Hasil' untuk bersihkan semua."
             )
         return "Siap. File input, segmen sementara & hasil akhir disimpan ke Drive; segmen terhapus otomatis saat selesai."
@@ -1640,12 +1701,12 @@ def launch_fast_ui(share: bool = True) -> None:
 
         with gr.Row():
             segment_frames_in = gr.Slider(
-                minimum=100,
-                maximum=600,
+                minimum=50,
+                maximum=500,
                 step=50,
-                value=int(saved_cfg.get("segment_frames", 150)),
+                value=int(saved_cfg.get("segment_frames", 100)),
                 label="Ukuran Segmen Sementara (Frame)",
-                info="150 frame (~5-6 detik) cepat tersimpan ke Drive tiap segmen agar tahan disconnect.",
+                info="100 frame (~3-4 detik) ditulis atomik ke Drive agar bebas korup saat disconnect.",
             )
             fresh_start_in = gr.Checkbox(
                 value=False,
@@ -1792,7 +1853,7 @@ def main() -> None:
     parser.add_argument("--eye-expr", type=float, default=0.35)
     parser.add_argument("--temporal-smooth", action="store_true")
     parser.add_argument("--top-sharp-fsz", action="store_true")
-    parser.add_argument("--segment-frames", type=int, default=150)
+    parser.add_argument("--segment-frames", type=int, default=100)
     parser.add_argument("--fresh-start", action="store_true")
     args = parser.parse_args()
 
