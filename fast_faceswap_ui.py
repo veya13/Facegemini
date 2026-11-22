@@ -1866,7 +1866,7 @@ def launch_fast_ui(share: bool = True) -> None:
             protect_mouth_in,
             use_color_in,
             use_temporal_in,
-            top_sharp_fsz_in := top_sharp_in,
+            top_sharp_in,
             face_mode_in,
             det_size_in,
             mask_blur_in,
