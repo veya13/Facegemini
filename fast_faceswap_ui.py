@@ -135,7 +135,6 @@ def download_from_list(filename: str, urls: List[str], min_bytes: int = 5_000_00
 
 
 def compute_job_id(source_file: str, target_file: str) -> str:
-    """Menghitung job_id stabil berdasarkan ukuran file (bukan nama sementara Gradio) agar selalu konsisten setelah reconnect."""
     sp = Path(source_file) if source_file else None
     tp = Path(target_file) if target_file else None
     s_size = sp.stat().st_size if (sp and sp.exists()) else 0
@@ -161,7 +160,7 @@ def inspect_valid_mp4(video_path: Path) -> Tuple[bool, int]:
 
 
 class DriveSegmentCheckpoint:
-    """Menyimpan input persisten, segmen sementara & progres di Google Drive secara atomik agar bebas moov atom error saat disconnect."""
+    """Menyimpan input persisten, segmen sementara & progres di Google Drive secara atomik agar bebas moov atom error & hilang input saat disconnect."""
 
     def __init__(self, workspace_root: Optional[Path] = None):
         root = workspace_root or DEFAULT_DRIVE_WORKSPACE
@@ -194,6 +193,7 @@ class DriveSegmentCheckpoint:
         try:
             self.inputs_dir.mkdir(parents=True, exist_ok=True)
             if src.resolve().parent == self.inputs_dir.resolve():
+                os.utime(str(src), None)
                 return str(src.resolve())
             stat = src.stat()
             ext = src.suffix.lower()
@@ -203,9 +203,29 @@ class DriveSegmentCheckpoint:
                 tmp_dst = self.inputs_dir / f".tmp_{prefix}_{sig}{ext}"
                 shutil.copy2(str(src), str(tmp_dst))
                 os.replace(str(tmp_dst), str(dst))
+            else:
+                os.utime(str(dst), None)
             return str(dst.resolve())
         except Exception:
             return str(src.resolve()) if src.exists() else None
+
+    def find_latest_persisted_inputs(self) -> Tuple[Optional[str], Optional[str]]:
+        """Mengambil file src_* dan tgt_* terbaru dari persisted_inputs jika state belum sempat tertulis."""
+        if not self.inputs_dir.exists():
+            return None, None
+        srcs = sorted(
+            [p for p in self.inputs_dir.glob("src_*") if p.is_file() and not p.name.startswith(".tmp_")],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        tgts = sorted(
+            [p for p in self.inputs_dir.glob("tgt_*") if p.is_file() and not p.name.startswith(".tmp_")],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        s_out = str(srcs[0].resolve()) if srcs else None
+        t_out = str(tgts[0].resolve()) if tgts else None
+        return s_out, t_out
 
     def job_dir(self, job_id: str) -> Path:
         d = self.temp_root / job_id
@@ -216,7 +236,6 @@ class DriveSegmentCheckpoint:
         return self.job_dir(job_id) / "render_state.json"
 
     def get_clean_valid_segments(self, job_id: str) -> Tuple[List[Path], int]:
-        """Membersihkan file .mp4 korup (tanpa moov atom) di folder segmen dan mengembalikan daftar segmen valid + total frame."""
         d = self.job_dir(job_id)
         for junk in d.glob("_tmp_*"):
             try:
@@ -294,7 +313,6 @@ class DriveSegmentCheckpoint:
         release_mem(clean_cuda=True)
 
     def finalize_video(self, job_id: str, target_path: Path, out_name: str = "hasil_swap.mp4") -> Tuple[bool, str]:
-        d = self.job_dir(job_id)
         segs, _ = self.get_clean_valid_segments(job_id)
         if not segs:
             return False, "Tidak ada segmen valid ditemukan."
@@ -856,7 +874,6 @@ def load_source_face(source_file: str, app, top_sharp_only: bool = False):
 
 
 def _crop_padded_face(img_bgr: np.ndarray, face, out_size: int = 256) -> np.ndarray:
-    """Memotong area wajah dengan margin proporsional 35% agar dahi, dagu, dan telinga tetap terjaga."""
     h, w = img_bgr.shape[:2]
     x1, y1, x2, y2 = [float(v) for v in face.bbox[:4]]
     bw, bh = x2 - x1, y2 - y1
@@ -1242,7 +1259,7 @@ def run_render_full(
     face_mode: str,
     det_size: int,
     mask_blur: int,
-    segment_frames: int = 100,
+    segment_frames: int = 50,
     fresh_start: bool = False,
     progress=None,
 ):
@@ -1253,6 +1270,13 @@ def run_render_full(
         source_file = latest_unfinished.get("settings", {}).get("source_file", "")
     if not target_file and latest_unfinished:
         target_file = latest_unfinished.get("settings", {}).get("target_file", "")
+
+    if not source_file or not target_file:
+        fb_src, fb_tgt = ckpt_mgr.find_latest_persisted_inputs()
+        if not source_file and fb_src:
+            source_file = fb_src
+        if not target_file and fb_tgt:
+            target_file = fb_tgt
 
     if not source_file or not target_file:
         raise ValueError("Sumber wajah dan target wajib diisi.")
@@ -1342,7 +1366,19 @@ def run_render_full(
             start_idx = 0
             seg_num = 0
 
-        seg_step = max(50, int(segment_frames))
+        ckpt_mgr.save_job_state(
+            job_id,
+            {
+                "job_id": job_id,
+                "last_completed_idx": start_idx,
+                "total_frames": total,
+                "next_seg_num": seg_num,
+                "completed": False,
+                "settings": settings_snapshot,
+            },
+        )
+
+        seg_step = max(25, int(segment_frames))
         tracker = TemporalFaceTracker() if use_temporal_smooth else None
         if use_temporal_smooth and start_idx > 0:
             cap_warm = cv2.VideoCapture(str(target_path))
@@ -1361,7 +1397,6 @@ def run_render_full(
             if final_seg_file.exists():
                 final_seg_file.unlink()
 
-            # Tulis ke disk lokal (/tmp) dulu agar Google Drive tidak pernah berisi file MP4 setengah jadi (tanpa moov atom)
             local_seg_fd, local_seg_path_str = tempfile.mkstemp(prefix=f"seg_{seg_num:04d}_", suffix=".mp4")
             os.close(local_seg_fd)
             local_seg_file = Path(local_seg_path_str)
@@ -1419,7 +1454,6 @@ def run_render_full(
                 cap.release()
                 writer.release()
 
-            # Pindahkan segmen yang sudah tertutup sempurna (valid moov atom) secara atomik ke Google Drive
             ok_seg, _ = inspect_valid_mp4(local_seg_file)
             if processed_this_seg > 0 and ok_seg:
                 drive_tmp_seg = job_dir / f"_tmp_part_{seg_num:04d}.mp4"
@@ -1509,6 +1543,13 @@ def launch_fast_ui(share: bool = True) -> None:
     init_source_file = _valid_existing_file(saved_cfg.get("source_file"))
     init_target_file = _valid_existing_file(saved_cfg.get("target_file"))
 
+    if not init_source_file or not init_target_file:
+        fb_src, fb_tgt = ckpt_mgr.find_latest_persisted_inputs()
+        if not init_source_file:
+            init_source_file = _valid_existing_file(fb_src)
+        if not init_target_file:
+            init_target_file = _valid_existing_file(fb_tgt)
+
     def initial_resume_banner() -> str:
         latest = ckpt_mgr.find_latest_unfinished()
         if latest:
@@ -1519,6 +1560,8 @@ def launch_fast_ui(share: bool = True) -> None:
                 f"Auto-Resume aktif: {valid_cnt}/{tot_f} frame valid tersimpan di Google Drive. "
                 f"Klik 'Render Video Lengkap' untuk menyambung, atau klik 'Hapus History & File Hasil' untuk bersihkan semua."
             )
+        if init_source_file or init_target_file:
+            return "File sebelumnya ditemukan di Google Drive dan dimuat otomatis. Klik 'Render Video Lengkap' untuk melanjutkan."
         return "Siap. File input, segmen sementara & hasil akhir disimpan ke Drive; segmen terhapus otomatis saat selesai."
 
     def reset_all_history_and_outputs():
@@ -1701,12 +1744,12 @@ def launch_fast_ui(share: bool = True) -> None:
 
         with gr.Row():
             segment_frames_in = gr.Slider(
-                minimum=50,
-                maximum=500,
-                step=50,
-                value=int(saved_cfg.get("segment_frames", 100)),
+                minimum=25,
+                maximum=400,
+                step=25,
+                value=int(saved_cfg.get("segment_frames", 50)),
                 label="Ukuran Segmen Sementara (Frame)",
-                info="100 frame (~3-4 detik) ditulis atomik ke Drive agar bebas korup saat disconnect.",
+                info="50 frame (~1,5–2 detik) cepat tersimpan atomik ke Drive agar tahan disconnect.",
             )
             fresh_start_in = gr.Checkbox(
                 value=False,
@@ -1823,7 +1866,7 @@ def launch_fast_ui(share: bool = True) -> None:
             protect_mouth_in,
             use_color_in,
             use_temporal_in,
-            top_sharp_in,
+            top_sharp_fsz_in := top_sharp_in,
             face_mode_in,
             det_size_in,
             mask_blur_in,
@@ -1853,7 +1896,7 @@ def main() -> None:
     parser.add_argument("--eye-expr", type=float, default=0.35)
     parser.add_argument("--temporal-smooth", action="store_true")
     parser.add_argument("--top-sharp-fsz", action="store_true")
-    parser.add_argument("--segment-frames", type=int, default=100)
+    parser.add_argument("--segment-frames", type=int, default=50)
     parser.add_argument("--fresh-start", action="store_true")
     args = parser.parse_args()
 
